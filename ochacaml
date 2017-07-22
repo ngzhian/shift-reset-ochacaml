@@ -1,0 +1,4 @@
+#!/bin/sh
+# set srcdir to the src directory of cl75:
+srcdir=~/Downloads/cl75/src
+exec $srcdir/camlrun $srcdir/toplevel/camltop -stdlib $srcdir/lib $*

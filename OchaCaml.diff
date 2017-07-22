@@ -1,0 +1,3303 @@
+diff -urN cl75/config/m.h OchaCaml/config/m.h
+--- cl75/config/m.h	1999-06-12 06:02:22.000000000 +0900
++++ OchaCaml/config/m.h	2014-04-14 14:04:07.000000000 +0900
+@@ -1,3 +1,3 @@
+ #define CAML_SIXTYFOUR
+ #undef CAML_BIG_ENDIAN
+-#define CAML_ALIGNMENT
++#undef CAML_ALIGNMENT
+diff -urN cl75/config/s.h OchaCaml/config/s.h
+--- cl75/config/s.h	1999-06-12 06:02:44.000000000 +0900
++++ OchaCaml/config/s.h	2014-04-14 14:04:07.000000000 +0900
+@@ -3,6 +3,7 @@
+ #endif
+ #define HAS_MEMMOVE
+ #define HAS_BCOPY
++#define HAS_MEMCPY
+ #define sighandler_return_type void
+ #define BSD_SIGNALS
+ #define HAS_RENAME
+diff -urN cl75/contrib/Makefile OchaCaml/contrib/Makefile
+--- cl75/contrib/Makefile	2000-11-12 08:57:42.000000000 +0900
++++ OchaCaml/contrib/Makefile	2014-04-14 14:04:07.000000000 +0900
+@@ -4,8 +4,8 @@
+ # See the file INDEX for a description of the packages and their requirements.
+ # Remember that "libunix" is required for
+ # "debugger", "libgraph", "camltk", "camltk4", and "search_isos".
+-PACKAGES=libunix libgraph debugger libnum libstr mletags \
+-  camlmode lorder profiler camltk4 camlsearch
++PACKAGES=libunix debugger libnum libstr mletags \
++  camlmode lorder profiler camlsearch
+ # caml-tex
+ # caml-latex2e
+ # camltk
+diff -urN cl75/src/Makefile OchaCaml/src/Makefile
+--- cl75/src/Makefile	1999-03-03 22:25:57.000000000 +0900
++++ OchaCaml/src/Makefile	2014-04-14 14:04:07.000000000 +0900
+@@ -9,13 +9,13 @@
+ # This option circumvents a gcc bug on some platforms (680x0, 80386).
+ # If you are using Linux with libc6 (RedHat 5, Debian 2), add -D__FAVOR_BSD
+ # This option avoids signal-related problems.
+-OPTS=-fno-defer-pop -D__FAVOR_BSD
++OPTS=-fno-defer-pop -D__FAVOR_BSD -no-cpp-precomp
+ 
+ # Extra libraries that have to be linked with the runtime system.
+ # The math library "-lm" is linked by default.
+ # On most machines, nothing else is needed.
+ # Under Solaris: -lsocket -lnsl
+-LIBS=
++LIBS= -lm
+ 
+ # How to call the C preprocessor on a file that does not have the .c extension.
+ # That's /lib/cpp on most machines, sometimes /usr/bin/cpp,
+@@ -26,7 +26,7 @@
+ # not all Unix C preprocessors define it.
+ # If your cpp is too fussy, make tools/clprepro and use this:
+ # CPP=../../src/tools/clprepro -Dunix
+-CPP=/lib/cpp -P -traditional -Dunix
++CPP=/usr/bin/cpp -P -traditional -Dunix
+ 
+ # The directory where public executables will be installed
+ BINDIR=/usr/local/bin
+diff -urN cl75/src/compiler/back.ml OchaCaml/src/compiler/back.ml
+--- cl75/src/compiler/back.ml	1996-12-14 04:51:14.000000000 +0900
++++ OchaCaml/src/compiler/back.ml	2014-04-14 14:04:07.000000000 +0900
+@@ -17,10 +17,10 @@
+ 
+ (* Label generation *)
+ 
+-let label_counter = ref 0;;
++let label_counter = ref 1 (* 0 *);;
+ 
+ let reset_label () =
+-  label_counter := 0
++  label_counter := 1 (* 0 *)
+ and new_label () =
+   incr label_counter; !label_counter
+ ;;
+@@ -175,8 +175,9 @@
+ ;;
+ 
+ (* To keep track of function bodies that remain to be compiled. *)
++(* 最後の bool は、shift/reset の引数かどうかを表す *)
+ 
+-let still_to_compile  = (stack__new () : (lambda * int) stack__t);;
++let still_to_compile  = (stack__new () : (lambda * int * bool) stack__t);;
+ 
+ (* The translator from lambda terms to lists of instructions.
+ 
+@@ -197,6 +198,23 @@
+        (match code with
+           (Kquote _ | Kget_global _ | Kaccess _ | Kpushmark) :: _ -> code
+         | _ -> Kquote cst :: code)
++  | Lapply(Lreset e, args) -> 
++      let lbl = new_label() in
++	(* 最後を return ではなく endshiftreset にするため *)
++	stack__push (e, lbl, true) still_to_compile;
++	let code' = Kclosure lbl :: Kprim Preset :: code in
++	let code' = (match args with [] -> code' | _ -> Kpush :: code') in
++        Kpushmark :: compexplist args code'
++  | Lapply(Lshift e, args) -> 
++      let lbl = new_label() in
++	(* 最後を return ではなく endshiftreset にするため *)
++	stack__push (e, lbl, true) still_to_compile;
++	let code' = (match args with [] -> code | _ -> Kapply :: code) in
++	let code' = Kclosure lbl :: Kprim Pshift :: code' in
++	let code' = (match args with [] -> code' | _ -> Kpush :: code') in
++	(match args with
++	     [] -> code'
++	   | _ -> Kpushmark :: compexplist args code')
+   | Lapply(body, args) ->
+         if is_return code then
+           compexplist args (Kpush ::
+@@ -209,7 +227,7 @@
+           Kgrab :: compexp body code
+         else begin
+           let lbl = new_label() in
+-            stack__push (body, lbl) still_to_compile;
++            stack__push (body, lbl, false) still_to_compile;
+             Kclosure lbl :: code
+           end
+   | Llet(args, body) ->
+@@ -224,7 +242,7 @@
+   | Lletrec([Lfunction f, _], body) ->
+         let code1 = if is_return code then code else Kendlet 1 :: code in
+         let lbl = new_label() in
+-          stack__push (f, lbl) still_to_compile;
++          stack__push (f, lbl, false) still_to_compile;
+           Kletrec1 lbl :: compexp body code1
+   | Lletrec(args, body) ->
+         let size = list_length args in
+@@ -391,6 +409,20 @@
+            then compexp expr code (* don't destroy tail call opt. *)
+            else compexp expr (Kevent event :: code)
+        end
++  (* 何も考えずにやってみた *)
++  | Lreset expr ->
++      let lbl = new_label() in
++	(* 最後を return ではなく endshiftreset にするため *)
++	stack__push (expr, lbl, true) still_to_compile;
++	Kclosure lbl :: Kprim Preset :: code
++(*      compexp (Lprim (Preset, [Lfunction expr])) (Kendshiftreset :: code) *)
++  | Lshift expr ->
++      let lbl = new_label() in
++	stack__push (expr, lbl, true) still_to_compile;
++	Kclosure lbl :: Kprim Pshift :: code
++(*      compexp (Lprim (Pshift, [Lfunction expr])) (Kendshiftreset :: code) *)
++
++
+ 
+   and compexplist = fun
+       [] code -> code
+@@ -476,8 +508,15 @@
+ 
+ let rec compile_rest code =
+   try
+-    let (exp, lbl) = stack__pop still_to_compile in
+-      compile_rest (Klabel lbl :: compile_expr Nolabel exp (Kreturn :: code))
++    let (exp, lbl, b) = stack__pop still_to_compile in
++(*    let code' = compile_expr Nolabel exp (Kreturn :: code) in
++    let code' = 
++      if b then (rev (Kendshiftreset :: (tl (rev code'))))
++      else code' in
++    compile_rest (Klabel lbl :: code')  *)
++      compile_rest (Klabel lbl :: compile_expr Nolabel exp 
++		      ((if b then [Kendshiftreset; Kreturn] 
++			else [Kreturn]) @ code)) 
+   with stack__Empty ->
+     code
+ ;;
+diff -urN cl75/src/compiler/builtins.ml OchaCaml/src/compiler/builtins.ml
+--- cl75/src/compiler/builtins.ml	1996-11-26 00:03:45.000000000 +0900
++++ OchaCaml/src/compiler/builtins.ml	2014-04-14 14:04:07.000000000 +0900
+@@ -44,8 +44,8 @@
+     (* This assumes that "num" is the first type defined in "num". *)
+ ;;
+ 
+-let type_arrow (t1,t2) =
+-  {typ_desc=Tarrow(t1, t2); typ_level=notgeneric}
++let type_arrow (t1,t2,t3,t4) =
++  {typ_desc=Tarrow(t1, t2, t3, t4); typ_level=notgeneric}
+ and type_product tlist =
+   {typ_desc=Tproduct(tlist); typ_level=notgeneric}
+ and type_unit =
+diff -urN cl75/src/compiler/compiler.ml OchaCaml/src/compiler/compiler.ml
+--- cl75/src/compiler/compiler.ml	1996-12-14 04:51:15.000000000 +0900
++++ OchaCaml/src/compiler/compiler.ml	2014-04-14 14:04:07.000000000 +0900
+@@ -77,6 +77,11 @@
+       remove_infix name
+   | Zdir("directory", dirname) ->
+       load_path := dirname :: !load_path
++  | Zdir("answer", name) ->
++      if name = "all" || name = "none" 
++      then types__typ_option := name
++      else (eprintf "This option is not supported\n";
++	    flush stderr)
+   | Zdir(d, name) ->
+       eprintf 
+         "%aWarning: unknown directive \"#%s\", ignored.\n"
+diff -urN cl75/src/compiler/config.mlp OchaCaml/src/compiler/config.mlp
+--- cl75/src/compiler/config.mlp	1994-12-22 19:23:38.000000000 +0900
++++ OchaCaml/src/compiler/config.mlp	2014-04-14 14:04:07.000000000 +0900
+@@ -41,5 +41,5 @@
+  * error_prompt: Printed before compiler error and warning messages.
+  *)
+ 
+-let toplevel_input_prompt = "#";;
+-let error_prompt = ">";;
++let toplevel_input_prompt = "# ";;
++let error_prompt = "> ";;
+diff -urN cl75/src/compiler/emit_phr.ml OchaCaml/src/compiler/emit_phr.ml
+--- cl75/src/compiler/emit_phr.ml	1994-11-10 18:59:44.000000000 +0900
++++ OchaCaml/src/compiler/emit_phr.ml	2014-04-14 14:04:07.000000000 +0900
+@@ -25,21 +25,26 @@
+ ;;
+ 
+ let emit_phrase outchan is_pure phr =
++(*  print_int 3; print_newline () ;*)
+   reloc__reset();
+   event__reset();
+   init_out_code();
+   labels__reset_label_table();
+   begin match phr with
+     { kph_fcts = [] } ->
+-        emit phr.kph_init
+-  | { kph_rec = false } ->
++(*        emit [Klabel 1; Kprim prim__Pcopyblocks];	(* added *) *)
++        emit phr.kph_init;
++        emit [Klabel 1; Kprim prim__Pcopyblocks]	(* added *)
++  | { kph_rec = false } -> 
+         emit [Kbranch 0];
++	emit [Klabel 1; Kprim prim__Pcopyblocks];	(* added *)
+         emit phr.kph_fcts;
+         emit [Klabel 0];
+         emit phr.kph_init
+   | { kph_rec = true } ->
+         emit phr.kph_init;
+         emit [Kbranch 0];
++	emit [Klabel 1; Kprim prim__Pcopyblocks];	(* added *)
+         emit phr.kph_fcts;
+         emit [Klabel 0]
+   end;
+diff -urN cl75/src/compiler/emitcode.ml OchaCaml/src/compiler/emitcode.ml
+--- cl75/src/compiler/emitcode.ml	1996-12-14 04:51:15.000000000 +0900
++++ OchaCaml/src/compiler/emitcode.ml	2014-04-14 14:04:07.000000000 +0900
+@@ -194,6 +194,9 @@
+         ev.ev_pos <- !out_position;
+         event__enter ev;
+         emit code
++    | Kendshiftreset :: code -> 
++	out ENDSHIFTRESET;
++	emit code
+     | instr :: code ->
+         out(match instr with
+            Kreturn -> RETURN
+diff -urN cl75/src/compiler/error.ml OchaCaml/src/compiler/error.ml
+--- cl75/src/compiler/error.ml	1997-04-01 23:16:58.000000000 +0900
++++ OchaCaml/src/compiler/error.ml	2014-04-14 14:04:07.000000000 +0900
+@@ -292,3 +292,27 @@
+     output_input_name modname;
+   flush stderr
+ ;;
++
++let answer_type_err t1 t2 = 
++  eprintf "tried to unify\n  ";
++  output_type stderr t1;
++  eprintf " and ";
++  output_type stderr t2;
++  eprintf "\n(answer type cannot unify)\n";
++  raise Toplevel
++;;
++
++let impure_exp_err t1 t2 = 
++  eprintf "This expression is not pure.\n";
++  eprintf "Answer types are %a and %a.\n" 
++    output_type t1
++    output_type t2;
++  raise Toplevel
++;;
++
++let impure_exp_err' () =
++  eprintf "This expression is not pure.\n";
++  eprintf "Answer types are '_a and '_a.\n";
++  raise Toplevel
++;;
++
+diff -urN cl75/src/compiler/front.ml OchaCaml/src/compiler/front.ml
+--- cl75/src/compiler/front.ml	1996-12-14 04:51:16.000000000 +0900
++++ OchaCaml/src/compiler/front.ml	2014-04-14 14:04:07.000000000 +0900
+@@ -47,6 +47,8 @@
+       do_list (fun (pat,expr) -> check_letrec_expr expr) pat_expr_list;
+       check_letrec_expr body      
+   | Zparser _ -> ()
++  | Zreset (_, e) -> check_letrec_expr e
++  | Zshift (_, _, e) -> check_letrec_expr e
+   | _ ->
+       illegal_letrec_expr expr.e_loc
+ ;;
+@@ -74,6 +76,10 @@
+       size_of_expr body      
+   | Zparser _ ->
+       2
++  | Zreset (_, e) ->
++      size_of_expr e
++  | Zshift (_, _, e) -> 
++      size_of_expr e
+   | _ ->
+       illegal_letrec_expr expr.e_loc
+ ;;
+@@ -291,10 +297,70 @@
+   | Zstream stream_comp_list ->
+       translate_stream translate_expr env stream_comp_list
+   | Zparser case_list ->
+-      let (stream_type, _) = types__filter_arrow expr.e_typ in
++      let (stream_type, _, _, _) = types__filter_arrow expr.e_typ in
+       translate_parser translate_expr expr.e_loc env case_list stream_type
+   | Zwhen(e1,e2) ->
+       fatal_error "front: Zwhen"
++(*
++  | Zshift(({ p_desc = Zvarpat id } as pat1), 
++	   ({ p_desc = Zvarpat id' } as pat2), e) -> 
++      (* 暫定 ... *)
++      let ty = no_type in
++      let lo = location__no_location in
++      let s = "call_shift" in
++      let f = 
++	{ e_desc = 
++	    Zident (ref(Zglobal{ info = { val_typ = ty; 
++					  val_prim = ValuePrim (1, Pshift) }; 
++				 qualid = { qual = s; id = s } })); 
++	  e_loc = lo;
++	  e_typ = ty } in
++      let arg = { e_desc = Zident (ref(Zlocal id')); 
++		  e_loc = pat1.p_loc;
++		  e_typ = pat1.p_typ } in
++      let app = { e_desc = Zapply (f, [arg]);
++		  e_loc = pat2.p_loc;
++		  e_typ = pat2.p_typ } in
++      (* k の方で env 拡張 *)
++      let new_env = add_for_parameter_to_env env id in
++      translate_expr new_env
++	({ e_desc = 
++	     Zlet(false, 
++		  [({ p_desc = Zaliaspat (pat2, id); 
++		      p_loc = pat1.p_loc; p_typ = pat1.p_typ }, e)], app);
++	   e_loc = pat2.p_loc;
++	   e_typ = pat2.p_typ})
++  | Zreset(({ p_desc = Zvarpat id } as pat), e) ->
++      (* 暫定 ... *)
++      let ty = no_type in
++      let lo = location__no_location in
++      let r = "call_reset" in
++      let f = 
++	{ e_desc = 
++	    Zident (ref(Zglobal{ info = { val_typ = ty; 
++					  val_prim = ValuePrim (1, Preset) }; 
++				 qualid = { qual = r; id = r } })); 
++	  e_loc = lo;
++	  e_typ = ty } in
++      let arg = { e_desc = Zident (ref(Zlocal id)); 
++		  e_loc = pat.p_loc;
++		  e_typ = pat.p_typ } in
++      let app = { e_desc = Zapply (f, [arg]);
++		  e_loc = pat.p_loc;		(* 胡散臭い *)
++		  e_typ = pat.p_typ } in	(* 胡散臭い *)
++      transl ({ e_desc = Zlet(false, [(pat, e)], app);
++	        e_loc = pat.p_loc;
++		e_typ = pat.p_typ}) *)
++  | Zreset (_, e) -> 
++      Lreset (transl e) 
++(*      let new_env = Treserved env in
++      Lreset (translate_expr new_env e) *)
++  | Zshift ({ p_desc = Zvarpat id; p_typ = ty }, _, e) -> 
++      (* 本当にこれで OK なのか、は甚だしく謎 *)
++      let var = var_root id ty in
++      let new_env = Tenv([var], env) in
++      Lshift (translate_expr new_env e)
++  | Zshift _ -> failwith "not happend"
+   in transl
+ 
+ and transl_action env (patlist, expr) =
+diff -urN cl75/src/compiler/globals.ml OchaCaml/src/compiler/globals.ml
+--- cl75/src/compiler/globals.ml	1994-11-10 18:59:49.000000000 +0900
++++ OchaCaml/src/compiler/globals.ml	2014-04-14 14:04:07.000000000 +0900
+@@ -39,7 +39,7 @@
+     mutable typ_level: int }            (* Binding level *)
+ and typ_desc =
+     Tvar of mutable typ_link            (* A type variable *)
+-  | Tarrow of typ * typ                 (* A function type *)
++  | Tarrow of typ * typ * typ * typ     (* A function type *)
+   | Tproduct of typ list                (* A tuple type *)
+   | Tconstr of type_constr global * typ list  (* A constructed type *)
+ and typ_link =
+diff -urN cl75/src/compiler/instruct.ml OchaCaml/src/compiler/instruct.ml
+--- cl75/src/compiler/instruct.ml	1994-11-10 18:59:50.000000000 +0900
++++ OchaCaml/src/compiler/instruct.ml	2014-04-14 14:04:07.000000000 +0900
+@@ -33,6 +33,7 @@
+   | Kbranchinterval of int * int * int * int
+   | Kswitch of int vect
+   | Kevent of lambda__event
++  | Kendshiftreset
+ ;;
+ 
+ type zam_phrase =
+@@ -43,3 +44,64 @@
+ 
+ let Nolabel = (-1)
+ ;;
++
++let print_inst ph = 
++  print_string "code:\n  ";
++  let f = 
++    list__do_list
++      (fun inst -> 
++	 print_string
++	   (match inst with
++	      | Kquote s -> 
++		  "Kquote " ^ 
++		    (match s with
++		       | SCatom ac -> 
++			   (match ac with 
++			      | ACint i -> string_of_int i
++			      | ACfloat f -> string_of_float f
++			      | ACstring s -> s
++			      | ACchar c -> char__string_of_char c)
++		       | SCblock (tag, lst) -> 
++			   "block" ^ string_of_int (list_length lst))
++		  ^ "; "
++	      | Kget_global _ -> "Kget_global; "
++	      | Kset_global _ -> "Kset_global; "
++	      | Kaccess n -> "Kaccess " ^ (string_of_int n) ^ "; "
++	      | Kgrab -> "Kgrab; "
++	      | Kpush -> "Kpush; "
++	      | Kpushmark -> "Kpushmark; "
++	      | Klet -> "Klet; "
++	      | Kendlet n -> "Kendlet " ^ (string_of_int n) ^ "; "
++	      | Kapply -> "Kapply; "
++	      | Ktermapply -> "Ktermapply; "
++	      | Kcheck_signals -> "Kcheck_signals; "
++	      | Kreturn -> "Kreturn; "
++	      | Kclosure n -> "Kclosure " ^ (string_of_int n) ^ "; "
++	      | Kletrec1 n -> "Kletrec1 " ^ (string_of_int n) ^ "; "
++	      | Kmakeblock (_, i) -> "Kmakeblock " ^ (string_of_int i) ^ "; "
++	      | Kprim p -> (match p with
++			      | Pshift -> "Shift; "
++			      | Preset -> "Reset; "
++			      | _ -> "Kprim; ")
++	      | Kpushtrap n -> "Kpushtrap " ^ (string_of_int n) ^ "; "
++	      | Kpoptrap -> "Kpoptrap; "
++	      | Klabel n -> "Klabel " ^ (string_of_int n) ^ "; "
++	      | Kbranch n -> "Kbranch " ^ (string_of_int n) ^ "; "
++	      | Kbranchif n -> "Kbranchif " ^ (string_of_int n) ^ "; "
++	      | Kbranchifnot n -> 
++		  "Kbranchifnot " ^ (string_of_int n) ^ "; "
++	      | Kstrictbranchif n -> 
++		  "Kstrictbranchif " ^ (string_of_int n) ^ "; "
++	      | Kstrictbranchifnot n -> 
++		  "Kstrichbranchifnot " ^ (string_of_int n) ^ "; "
++	      | Ktest _ -> "Ktest; "
++	      | Kbranchinterval _ -> "Kbranchinterval; "
++	      | Kswitch _ -> "Kswitch; "
++	      | Kevent _ -> "Kevent; "
++	      | Kendshiftreset -> "Kendshiftreset; ")) in
++    print_string "init:\n";
++    f ph.kph_init;
++    print_newline ();
++    print_string "fcts:\n";
++    f ph.kph_fcts;
++    print_newline ();;
+diff -urN cl75/src/compiler/lambda.ml OchaCaml/src/compiler/lambda.ml
+--- cl75/src/compiler/lambda.ml	1996-01-18 02:27:42.000000000 +0900
++++ OchaCaml/src/compiler/lambda.ml	2014-04-14 14:04:07.000000000 +0900
+@@ -61,6 +61,8 @@
+   | Lfor of lambda * lambda * bool * lambda
+   | Lshared of lambda * int ref
+   | Levent of event * lambda
++  | Lshift of lambda 
++  | Lreset of lambda 
+ ;;
+ 
+ let share_lambda l =
+diff -urN cl75/src/compiler/lexer.mlp OchaCaml/src/compiler/lexer.mlp
+--- cl75/src/compiler/lexer.mlp	1996-12-12 02:05:05.000000000 +0900
++++ OchaCaml/src/compiler/lexer.mlp	2014-04-14 14:04:07.000000000 +0900
+@@ -44,6 +44,9 @@
+   "where", WHERE;
+   "while", WHILE;
+   "with", WITH;
++  "shift", SHIFT;  (* added *)
++  "reset", RESET;  (* added *)
++  
+ 
+   "quo", INFIX3("quo");
+   "mod", INFIX3("mod");
+@@ -186,6 +189,7 @@
+   | "*" { STAR }
+   | "," { COMMA }
+   | "->" { MINUSGREATER }
++  | "/" { SLASH }
+   | "." { DOT }
+   | ".." { DOTDOT }
+   | ".(" { DOTLPAREN }
+diff -urN cl75/src/compiler/modules.ml OchaCaml/src/compiler/modules.ml
+--- cl75/src/compiler/modules.ml	1997-02-04 02:19:01.000000000 +0900
++++ OchaCaml/src/compiler/modules.ml	2014-04-14 14:04:07.000000000 +0900
+@@ -130,7 +130,83 @@
+ 
+ let open_module name =
+   let module = find_module name in
+-  add_table module.mod_values (!opened_modules).mod_values;
++
++(*
++  let i = ref (int_of_char `a`) in
++  let c () = let a = !i in i := a + 1; "'" ^ (char__string_of_char (char_of_int a)) in
++  let rec to_str = function
++    | Tvar Tnolink -> "a" (* c () *)
++    | Tvar (Tlinkto t) -> "b" (* to_strd t *)
++    | Tarrow (t1, t2, t3, t4) ->
++	(to_strd t1) ^ " / " ^ (to_strd t2) ^ " -> " ^ 
++	  (to_strd t3) ^ " / " ^ (to_strd t4) 
++    | Tproduct ts -> "d"
++(*	it_list (fun s t -> s ^ " * " ^ (to_strd t)) "" ts *)
++    | Tconstr o -> "const"
++  and to_strd t = to_str t.typ_desc in
++
++    print_newline();
++    hashtbl__do_table (fun s t -> 
++(*			 print_string s; (* (to_strd t.info.val_typ);  *) *)
++			 print_int (t.info.val_typ.typ_level);
++			 print_newline ()) 
++      module.mod_values ;
++
++  ここで書き換えてみよう !
++*)
++(*
++  let rec cleaned t = 
++    { typ_desc = cleaned_typ t.typ_desc; typ_level = t.typ_level }
++  (* Tarrow をこっそり書き換える (なにかおかしい ...) *)
++  and cleaned_typ t = match t with
++    | Tvar (Tlinkto t) -> Tvar (Tlinkto (cleaned t))
++    | Tvar _ -> t
++    | Tarrow (t1, t2, t3, t4) -> 
++	(* typ_level : 
++	     0 -> 1 回だけ instantiate 出来るの
++	     1 -> もっと poly なの *)
++	let t = { typ_desc = Tvar Tnolink; typ_level = generic } in
++	Tarrow (cleaned t1, t, cleaned t2, t)
++    | Tproduct ts -> Tproduct (map cleaned ts)
++    | Tconstr (g, ts) -> Tconstr (g, map cleaned ts) in
++  let cleaned_value v = 
++    { val_typ = cleaned v.val_typ; val_prim = v.val_prim } in
++  let cleaned_vglbl g = { qualid = g.qualid; info = cleaned_value g.info } in
++*)
++  (* Tarrow で generic に書き換えたときに、それを外側に伝播させるために
++     こんな感じにしている *)
++  let rec cleaned t = match t.typ_desc with
++    | Tvar (Tlinkto t) -> 
++	let (t', tl) = cleaned t in
++	{ typ_desc = Tvar (Tlinkto t'); typ_level = tl }, tl
++    | Tvar _ -> t, t.typ_level
++    | Tarrow (t1, t2, _, _) -> 
++	let t = { typ_desc = Tvar Tnolink; typ_level = generic } in
++	let (t1', _) = cleaned t1 and (t2', _) = cleaned t2 in
++	let t' = Tarrow (t1', t, t2', t) in
++        { typ_desc = t'; typ_level = generic }, generic
++    | Tproduct ts -> 
++	let (ts', tl) = cleaned_list ts t.typ_level in
++        { typ_desc = Tproduct ts'; typ_level = tl }, tl
++    | Tconstr (g, ts) -> 
++	let (ts', tl) = cleaned_list ts t.typ_level in
++	{ typ_desc = Tconstr (g, ts'); typ_level = tl }, tl
++  and cleaned_list ts tl =
++    let rec loop ts (acc_ts, tl) = match ts with
++      | [] -> rev acc_ts, tl
++      | t :: rest -> let (t', tl') = cleaned t in
++	  loop rest (t' :: acc_ts, if tl' < tl then tl' else tl) in
++      loop ts ([], tl) in
++  let cleaned_value v = 
++    { val_typ = fst (cleaned v.val_typ); val_prim = v.val_prim } in
++  let cleaned_vglbl g = { qualid = g.qualid; info = cleaned_value g.info } in
++
++(*  add_table module.mod_values (!opened_modules).mod_values;  *)
++  hashtbl__do_table_rev 
++    (fun s t -> 
++       hashtbl__add (!opened_modules).mod_values s (cleaned_vglbl t))
++    module.mod_values;
++
+   add_table module.mod_constrs (!opened_modules).mod_constrs;
+   add_table module.mod_labels (!opened_modules).mod_labels;
+   add_table module.mod_types (!opened_modules).mod_types;
+@@ -217,6 +293,12 @@
+           let res = hashtbl__find (sel_fct !opened_modules) s in
+           (* Record the module as actually used *)
+           (hashtbl__find !used_opened_modules res.qualid.qual) := true;
++(*
++	  hashtbl__do_table (fun a b -> 
++			       print_string b.qualid.id;
++			       print_newline()) 
++	    (sel_fct !opened_modules); 
++*)
+           res
+         with Not_found ->
+           raise Desc_not_found
+diff -urN cl75/src/compiler/par_aux.ml OchaCaml/src/compiler/par_aux.ml
+--- cl75/src/compiler/par_aux.ml	1998-12-02 19:52:48.000000000 +0900
++++ OchaCaml/src/compiler/par_aux.ml	2014-04-14 14:04:07.000000000 +0900
+@@ -133,3 +133,11 @@
+   in
+     makel (make_pat(Zconstruct0pat(constr_nil))) pats
+ ;;
++
++(* gensym *)
++
++let counter = ref 0;;
++let gensym s = counter := succ !counter; s ^ (string_of_int !counter);;
++
++let new_type () = Ztypevar (gensym "v");;
++
+diff -urN cl75/src/compiler/parser.mly OchaCaml/src/compiler/parser.mly
+--- cl75/src/compiler/parser.mly	1996-12-12 02:57:31.000000000 +0900
++++ OchaCaml/src/compiler/parser.mly	2014-04-14 14:04:07.000000000 +0900
+@@ -94,6 +94,9 @@
+ %token WHERE          /* "where" */
+ %token WHILE          /* "while" */
+ %token WITH           /* "with" */
++%token SHIFT          /* "shift" */ // added
++%token RESET          /* "reset" */ // added
++%token SLASH          /* "/" */     // added
+ 
+ /* Precedences and associativities. Lower precedences first. */
+ 
+@@ -116,7 +119,7 @@
+ %right INFIX1                           /* concatenations */
+ %right COLONCOLON                       /* cons */
+ %left  INFIX2 SUBTRACTIVE               /* additives, subtractives */
+-%left  STAR INFIX3                      /* multiplicatives */
++%left  STAR INFIX3 SLASH                /* multiplicatives */
+ %right INFIX4                           /* exponentiations */
+ %right prec_uminus
+ %left  INFIX
+@@ -186,6 +189,8 @@
+           { make_binop $2 $1 $3 }
+       | Expr INFIX3 Expr
+           { make_binop $2 $1 $3 }
++      | Expr SLASH Expr
++	  { make_binop "quo" $1 $3 }
+       | Expr INFIX2 Expr
+           { make_binop $2 $1 $3 }
+       | Expr SUBTRACTIVE Expr
+@@ -255,6 +260,34 @@
+           { make_expr(Zlet(false, $3, $1)) }
+       | Expr WHERE REC Binding_list  %prec WHERE
+           { make_expr(Zlet(true, $4, $1)) }
++      | SHIFT LPAREN FUN IDENT MINUSGREATER Expr RPAREN %prec prec_app // added
++          { make_expr(Zshift (make_pat (Zvarpat $4),
++	      (make_pat (Zvarpat (gensym "arg.shifh"))), $6)) }
++      | SHIFT LPAREN FUN UNDERSCORE MINUSGREATER Expr RPAREN
++        %prec prec_app // added 
++          { make_expr(Zshift (make_pat (Zvarpat (gensym "wildcard")),
++	      (make_pat (Zvarpat (gensym "arg.shifh"))), $6)) }
++      | SHIFT LPAREN FUN IDENT MINUSGREATER Expr RPAREN Simple_expr_list
++        %prec prec_app // added
++	  { make_apply 
++	      (make_expr(Zshift (make_pat (Zvarpat $4),
++		 (make_pat (Zvarpat (gensym "arg.shifh"))), $6)), $8) } 
++      | RESET LPAREN FUN LPAREN RPAREN MINUSGREATER Expr RPAREN Simple_expr_list
++        %prec prec_app
++	  { make_apply 
++	      (make_expr(Zreset (make_pat (Zvarpat (gensym "arg.reset")), $7)), 
++	       $9) }
++      | RESET LPAREN FUN LPAREN RPAREN MINUSGREATER Expr RPAREN %prec prec_app
++	  { make_apply 
++	      (make_expr(Zreset (make_pat (Zvarpat (gensym "arg.reset")), $7)), 
++	       []) }
++/*
++      | SHIFT LPAREN FUN IDENT MINUSGREATER Expr RPAREN %prec prec_app
++	  { make_expr(Zshift (make_pat (Zvarpat $4),
++			      (make_pat (Zvarpat (gensym "arg.shifh"))), $6)) }
++      | RESET LPAREN FUN LPAREN RPAREN MINUSGREATER Expr RPAREN %prec prec_app
++	  { make_expr(Zreset (make_pat (Zvarpat (gensym "arg.reset")), $7)) }
++*/
+ ;
+ 
+ Simple_expr :
+@@ -284,6 +317,24 @@
+           { make_binop "vect_item" $1 $3 }
+       | Simple_expr DOTLBRACKET Expr RBRACKET
+           { make_binop "nth_char" $1 $3 }
++      | SHIFT // added (shift = \x.shift k -> x k)
++          { let x = gensym "x" and k = gensym "cont" in 
++            make_expr 
++	      (Zfunction [[pat_constr_or_var x],
++			  make_expr(Zshift (make_pat (Zvarpat k),
++		            make_pat (Zvarpat (gensym "arg.shifh")), 
++		            make_apply(make_expr(Zident(ref(Zlocal x))), 
++				       [make_expr(Zident(ref(Zlocal k)))])))]) }
++
++      | RESET // added (reset = \x.<x ()>)
++          { let x = gensym "x" and u = expr_constr_or_ident (GRname "()") in
++            make_expr 
++	      (Zfunction [[pat_constr_or_var x],
++			  make_apply 
++			    (make_expr(Zreset 
++		              (make_pat (Zvarpat (gensym "arg.reset")), 
++		               make_apply(make_expr(Zident(ref(Zlocal x))), 
++					  [u]))), [])]) }
+ ;
+ 
+ Simple_expr_list :
+@@ -553,6 +604,7 @@
+       | SUBTRACTIVE     { $1 }    | PREFIX        { $1 }
+       | AMPERSAND       { "&" }   | AMPERAMPER    { "&&" }
+       | OR              { "or" }  | BARBAR        { "||" }
++      | SLASH           { "/" }
+ ;
+ 
+ Qual_ident :
+@@ -575,7 +627,10 @@
+       | Type_star_list
+           { make_typ(Ztypetuple(rev $1)) }
+       | Type MINUSGREATER Type
+-          { make_typ(Ztypearrow($1, $3)) }
++          { let ans_type = make_typ (new_type()) in
++	      make_typ(Ztypearrow($1, ans_type, $3, ans_type)) }
++      | Simple_type SLASH Simple_type MINUSGREATER Simple_type SLASH Simple_type
++	  { make_typ(Ztypearrow($1, $3, $5, $7)) }  
+ ;
+ 
+ Simple_type :
+diff -urN cl75/src/compiler/pr_type.ml OchaCaml/src/compiler/pr_type.ml
+--- cl75/src/compiler/pr_type.ml	1996-12-14 04:51:17.000000000 +0900
++++ OchaCaml/src/compiler/pr_type.ml	2014-04-14 14:04:07.000000000 +0900
+@@ -53,11 +53,19 @@
+     Tvar _ ->
+       output_string oc "'";
+       output_string oc (name_of_type_var sch ty)
+-  | Tarrow(ty1, ty2) ->
++  | Tarrow(ty1, ty2, ty3, ty4) ->
+       if priority >= 1 then output_string oc "(";
++      print_string "("; 
+       output_typ oc sch 1 ty1;
++      output_string oc " / ";
++      output_typ oc sch 0 ty2;  (* 0 ?? *)
++      print_string ")"; 
+       output_string oc " -> ";
+-      output_typ oc sch 0 ty2;
++      print_string "("; 
++      output_typ oc sch 0 ty3;  (* 0 ?? *)
++      output_string oc " / ";
++      output_typ oc sch 0 ty4;  (* 0 ?? *)
++      print_string ")"; 
+       if priority >= 1 then output_string oc ")"
+   | Tproduct(ty_list) ->
+       if priority >= 2 then output_string oc "(";
+@@ -86,6 +94,75 @@
+       output_typ_list oc sch priority sep rest
+ ;;
+ 
++let rec compare t1 t2 = match (t1.typ_desc, t2.typ_desc) with 
++  | Tvar Tnolink, Tvar Tnolink -> t1 == t2
++  | Tvar (Tlinkto t), _ -> compare t t2
++  | _, Tvar (Tlinkto t) -> compare t1 t
++  | _, _ -> false;;
++
++let rec output_typ oc sch priority ty tvars =
++  let ty = type_repr ty in
++  match ty.typ_desc with
++    Tvar _ ->
++      output_string oc "'";
++      output_string oc (name_of_type_var sch ty)
++  | Tarrow(ty1, ty2, ty3, ty4) 
++      when compare ty2 ty4 && false &&
++           for_all (fun ty -> not (compare ty2 ty))
++	     ((free_type_vars (-1) ty1) @ 
++		(free_type_vars (-1) ty3) @ tvars) ->
++      if priority >= 1 then output_string oc "(";
++      output_typ oc sch 1 ty1 ((free_type_vars (-1) ty3) @ tvars);
++      output_string oc " -> ";
++      output_typ oc sch 0 ty3 ((free_type_vars (-1) ty1) @ tvars);  (* 0 ?? *)
++      if priority >= 1 then output_string oc ")"
++  | Tarrow(ty1, ty2, ty3, ty4) ->
++      let ftv1 = free_type_vars (-1) ty1
++      and ftv2 = free_type_vars (-1) ty2
++      and ftv3 = free_type_vars (-1) ty3
++      and ftv4 = free_type_vars (-1) ty4 in
++      if priority >= 1 then output_string oc "(";
++(*      print_string "("; *)
++      output_typ oc sch 1 ty1 (tvars @ ftv2 @ ftv3 @ ftv4);
++      output_string oc " / ";
++      output_typ oc sch 1 ty2 (tvars @ ftv1 @ ftv3 @ ftv4);
++(*      print_string ")";  *)
++      output_string oc " -> ";
++(*      print_string "("; *)
++      output_typ oc sch 1 ty3 (tvars @ ftv2 @ ftv1 @ ftv4);
++      output_string oc " / ";
++      output_typ oc sch 1 ty4 (tvars @ ftv2 @ ftv3 @ ftv1);
++(*      print_string ")"; *)
++      if priority >= 1 then output_string oc ")"
++  | Tproduct(ty_list) ->
++      if priority >= 2 then output_string oc "(";
++      output_typ_list oc sch 2 " * " tvars ty_list;
++      if priority >= 2 then output_string oc ")"
++  | Tconstr(cstr, args) ->
++      begin match args with
++        []    -> ()
++      | [ty1] ->
++          output_typ oc sch 2 ty1 tvars; output_string oc " " 
++      | tyl ->
++          output_string oc "(";
++          output_typ_list oc sch 0 ", " tvars tyl;
++          output_string oc ") "
++      end;
++      output_global types_of_module oc cstr
++
++and output_typ_list oc sch priority sep tvars = function
++    [] ->
++      ()
++  | [ty] ->
++      output_typ oc sch priority ty tvars
++  | ty::rest ->
++      output_typ oc sch priority ty tvars;
++      output_string oc sep;
++      output_typ_list oc sch priority sep tvars rest
++;;
++
++let output_typ oc sch priority sep = output_typ oc sch priority sep [];;
++
+ let output_type oc ty = output_typ oc false 0 ty;;
+ 
+ let output_one_type oc ty = reset_type_var_name(); output_typ oc false 0 ty;;
+diff -urN cl75/src/compiler/prim.ml OchaCaml/src/compiler/prim.ml
+--- cl75/src/compiler/prim.ml	1996-01-18 02:27:43.000000000 +0900
++++ OchaCaml/src/compiler/prim.ml	2014-04-14 14:04:07.000000000 +0900
+@@ -25,6 +25,7 @@
+   | Pfloatprim of float_primitive
+   | Pstringlength | Pgetstringchar | Psetstringchar
+   | Pmakevector | Pvectlength | Pgetvectitem | Psetvectitem
++  | Pshift | Preset | Pcopyblocks
+ 
+ and float_primitive =
+     Pfloatofint
+diff -urN cl75/src/compiler/prim_opc.ml OchaCaml/src/compiler/prim_opc.ml
+--- cl75/src/compiler/prim_opc.ml	1994-11-02 02:35:53.000000000 +0900
++++ OchaCaml/src/compiler/prim_opc.ml	2014-04-14 14:04:07.000000000 +0900
+@@ -33,6 +33,9 @@
+   | Pvectlength -> VECTLENGTH
+   | Pgetvectitem -> GETVECTITEM
+   | Psetvectitem -> SETVECTITEM
++  | Pshift -> SHIFT
++  | Preset -> RESET
++  | Pcopyblocks -> COPYBLOCKS
+   | _ -> fatal_error "opcode_for_primitive"
+ ;;
+ 
+diff -urN cl75/src/compiler/syntax.ml OchaCaml/src/compiler/syntax.ml
+--- cl75/src/compiler/syntax.ml	1996-12-14 04:51:17.000000000 +0900
++++ OchaCaml/src/compiler/syntax.ml	2014-04-14 14:04:07.000000000 +0900
+@@ -9,7 +9,11 @@
+     te_loc: location }
+ and type_expression_desc =
+     Ztypevar of string
+-  | Ztypearrow of type_expression * type_expression
++  | Ztypearrow of    (* changed *)
++      (* argument type / answer type (before) -> 
++	                 return type / answer type (after) *)
++      type_expression * type_expression * type_expression * type_expression 
++(*      type_expression * type_expression *)
+   | Ztypetuple of type_expression list
+   | Ztypeconstr of global_reference * type_expression list
+ ;;
+@@ -58,6 +62,12 @@
+   | Zstream of stream_component list
+   | Zparser of (stream_pattern list * expression) list
+   | Zwhen of expression * expression
++  (* k の型 * shift の引数の式の型 * 式 *)
++  | Zshift of pattern * pattern * expression	(* added *)
++  (* reset の引数の式の型 * 式 *)
++  | Zreset of pattern * expression		(* added *)
++(*  | Zshift of string * expression	(* added *)
++  | Zreset of expression		(* added *) *)
+ 
+ and expr_ident =
+     Zglobal of value_desc global
+diff -urN cl75/src/compiler/tr_env.ml OchaCaml/src/compiler/tr_env.ml
+--- cl75/src/compiler/tr_env.ml	1996-01-18 02:27:44.000000000 +0900
++++ OchaCaml/src/compiler/tr_env.ml	2014-04-14 14:04:07.000000000 +0900
+@@ -24,7 +24,7 @@
+ 
+ let rec translate_access s env =
+   let rec transl i = function
+-    Tnullenv      -> fatal_error "translate_env"
++    Tnullenv      -> fatal_error "translate_env "
+   | Treserved env -> transl (i+1) env
+   | Tenv(l, env)  ->
+       try
+diff -urN cl75/src/compiler/ty_decl.ml OchaCaml/src/compiler/ty_decl.ml
+--- cl75/src/compiler/ty_decl.ml	1996-12-14 04:51:17.000000000 +0900
++++ OchaCaml/src/compiler/ty_decl.ml	2014-04-14 14:04:07.000000000 +0900
+@@ -193,6 +193,20 @@
+     do_list enter_val decl
+ ;;
+ 
++(* t1 と t2 が Tvar で = であり、かつ t の ftv に含まれないことを check *)
++(* (すなわち、pure/impure 判定) *)
++(* typ * typ * typ -> unit *)
++let check_answer_type (t1, t2, ty) =
++  let rec compare t1 t2 = match (t1.typ_desc, t2.typ_desc) with 
++    | Tvar Tnolink, Tvar Tnolink -> t1 == t2
++    | Tvar (Tlinkto t), _ -> compare t t2
++    | _, Tvar (Tlinkto t) -> compare t1 t
++    | _, _ -> false in
++  let ftv = free_type_vars (-1) ty in
++  if not (compare t1 t2) || exists (fun ty -> compare t1 ty) ftv
++  then impure_exp_err t1 t2
++;;
++
+ let type_letdef loc rec_flag pat_expr_list =
+   push_type_level();
+   let ty_list =
+@@ -206,9 +220,49 @@
+       (fun (name,(ty,mut_flag)) ->
+         add_value (defined_global name {val_typ=ty; val_prim=ValueNotPrim})) in
+   if rec_flag then enter_val env;
++  (* 継続つなげてみたけど ... (let x = ... の形のときだけ) *)
++  let ty_ans1_ref = ref (new_type_var())
++  and ty_ans2_ref = ref (new_type_var()) in
+   do_list2
+-    (fun (pat, exp) ty -> type_expect [] exp ty)
+-    pat_expr_list ty_list;
++    (if rec_flag
++     then (fun (pat, exp) ty -> 
++	     type_expect [] exp (new_type_var(), ty, new_type_var()))
++     else (fun (pat, exp) ty -> 
++	     (match exp.e_desc with
++		| Zfunction _ ->
++		    type_expect [] exp (new_type_var(), ty, new_type_var())
++		| _ -> 
++		    type_expect [] exp (!ty_ans1_ref, ty, !ty_ans2_ref); 
++		    check_answer_type (!ty_ans1_ref, !ty_ans2_ref, ty);
++		    ty_ans2_ref := !ty_ans1_ref;
++		    ty_ans1_ref := new_type_var()
++		  (*  ty_ans1_ref := !ty_ans2_ref;
++		    ty_ans2_ref := new_type_var() *)))) pat_expr_list ty_list;
++(*
++  if rec_flag 
++  then 
++    do_list2 
++      (fun (pat, exp) ty -> 
++(*	 let t1 = new_type_var() and t2 = new_type_var() in
++      (*	   generalize_type t1;
++	   generalize_type t2; *)
++	 type_expect [] exp (t1, ty, t2) *)
++       type_expect [] exp (new_type_var(), ty, new_type_var()))
++                pat_expr_list ty_list
++  else do_list2
++    (fun (pat, exp) ty -> 
++       (match exp.e_desc with
++	  | Zfunction _ ->
++	      type_expect [] exp (new_type_var(), ty, new_type_var())
++	  | _ -> 
++	      type_expect [] exp (!ty_ans1_ref, ty, !ty_ans2_ref); 
++	      ty_ans1_ref := !ty_ans2_ref;
++	      ty_ans2_ref := new_type_var()))
++(*
++       type_expect [] exp (!ty_ans1_ref, ty, !ty_ans2_ref);
++       ty_ans1_ref := !ty_ans2_ref;
++       ty_ans2_ref := new_type_var()) *)
++    pat_expr_list ty_list; *)
+   pop_type_level();
+   let gen_type =
+     map2 (fun (pat, expr) ty -> (is_nonexpansive expr, ty))
+@@ -221,9 +275,30 @@
+   
+ let type_expression loc expr =
+   push_type_level();
+-  let ty =
++  let (t1, ty, t2) =
+     type_expr [] expr in
+   pop_type_level();
+   if is_nonexpansive expr then generalize_type ty;
++(*  pr_type__output_type stdout t1;
++  print_newline ();
++  pr_type__output_type stdout t2;
++  print_newline (); *)
++  check_answer_type (t1, t2, ty);
++  (* 弱い多相の check 
++  if not (t1.typ_level = generic && t2.typ_level = generic)
++  then impure_exp_err t1 t2; *)
+   ty
++  (* pure でなければエラー 
++  let rec compare t1 t2 = match (t1.typ_desc, t2.typ_desc) with 
++    | Tvar Tnolink, Tvar Tnolink -> t1 == t2
++    | Tvar (Tlinkto t), _ -> compare t t2
++    | _, Tvar (Tlinkto t) -> compare t1 t
++    | _, _ -> false in
++  let ftv = free_type_vars (-1) ty in
++  (* t1 と t2 が Tvar で = であり、かつ ftv に含まれていないならば *)
++  if compare t1 t2 && for_all (fun ty -> not (compare t1 ty)) ftv
++  (* pure なので OK *)
++  then ty
++  (* でなければ error *)
++  else impure_exp_err () *)
+ ;;
+diff -urN cl75/src/compiler/types.ml OchaCaml/src/compiler/types.ml
+--- cl75/src/compiler/types.ml	1997-04-01 23:17:03.000000000 +0900
++++ OchaCaml/src/compiler/types.ml	2014-04-14 14:04:07.000000000 +0900
+@@ -5,6 +5,9 @@
+ #open "globals";;
+ #open "modules";;
+ 
++(* option *)
++let typ_option = ref "none";;
++
+ (* Type constructor equality *)
+ 
+ let same_type_constr cstr1 cstr2 =
+@@ -67,8 +70,8 @@
+     match ty.typ_desc with
+       Tvar _ ->
+         if ty.typ_level >= level then fv := ty :: !fv
+-  | Tarrow(t1,t2) ->
+-      free_vars t1; free_vars t2
++  | Tarrow(t1,t2,t3,t4) ->
++      free_vars t1; free_vars t2; free_vars t3; free_vars t4
+   | Tproduct(ty_list) ->
+       do_list free_vars ty_list
+   | Tconstr(c, ty_list) ->
+@@ -84,10 +87,19 @@
+   begin match ty.typ_desc with
+     Tvar _ ->
+       if ty.typ_level > !current_level then ty.typ_level <- generic
+-  | Tarrow(t1,t2) ->
++  | Tarrow(t1,t2,t3,t4) ->
+       let lvl1 = gen_type t1 in
+       let lvl2 = gen_type t2 in
+-      ty.typ_level <- if lvl1 <= lvl2 then lvl1 else lvl2
++      let lvl3 = gen_type t3 in
++      let lvl4 = gen_type t4 in
++      ty.typ_level <- 
++	if lvl1 <= lvl2
++	then if lvl3 <= lvl4
++	     then if lvl1 <= lvl3 then lvl1 else lvl3
++	     else if lvl1 <= lvl4 then lvl1 else lvl4
++	else if lvl3 <= lvl4
++	     then if lvl2 <= lvl3 then lvl2 else lvl3
++	     else if lvl2 <= lvl4 then lvl2 else lvl4
+   | Tproduct(ty_list) ->
+       ty.typ_level <- gen_type_list ty_list
+   | Tconstr(c, ty_list) ->
+@@ -116,8 +128,8 @@
+   match ty.typ_desc with
+     Tvar _ ->
+       if ty.typ_level > !current_level then ty.typ_level <- !current_level
+-  | Tarrow(t1, t2) ->
+-      nongen_type t1; nongen_type t2
++  | Tarrow(t1, t2, t3, t4) ->
++      nongen_type t1; nongen_type t2; nongen_type t3; nongen_type t4
+   | Tproduct ty_list ->
+       do_list nongen_type ty_list
+   | Tconstr(cstr, ty_list) ->
+@@ -139,9 +151,10 @@
+       if level == generic
+       then ty
+       else copy_type ty
+-  | {typ_desc = Tarrow(t1,t2); typ_level = level} as ty ->
++  | {typ_desc = Tarrow(t1,t2,t3,t4); typ_level = level} as ty ->
+       if level == generic
+-      then {typ_desc = Tarrow(copy_type t1, copy_type t2);
++      then {typ_desc = 
++	      Tarrow(copy_type t1, copy_type t2, copy_type t3, copy_type t4);
+             typ_level = notgeneric}
+       else ty
+   | {typ_desc = Tproduct tlist; typ_level = level} as ty ->
+@@ -166,9 +179,9 @@
+       if level == generic
+       then begin link <- Tnolink end
+       else cleanup_type ty
+-  | {typ_desc = Tarrow(t1,t2); typ_level = level} as ty ->
++  | {typ_desc = Tarrow(t1,t2,t3,t4); typ_level = level} as ty ->
+       if level == generic
+-      then (cleanup_type t1; cleanup_type t2)
++      then (cleanup_type t1; cleanup_type t2; cleanup_type t3; cleanup_type t4)
+       else ()
+   | {typ_desc = Tproduct(tlist); typ_level = level} as ty ->
+       if level == generic
+@@ -220,8 +233,8 @@
+       {typ_desc = Tvar _; typ_level = level} as ty' ->
+         if level > level0 then level <- level0;
+         ty' == v
+-    | {typ_desc = Tarrow(t1,t2)} ->
+-        occurs_rec t1 || occurs_rec t2
++    | {typ_desc = Tarrow(t1,t2,t3,t4)} ->
++        occurs_rec t1 || occurs_rec t2 || occurs_rec t3 || occurs_rec t4
+     | {typ_desc = Tproduct(ty_list)} ->
+         exists occurs_rec ty_list
+     | {typ_desc = Tconstr(_, ty_list)} ->
+@@ -247,9 +260,12 @@
+             link1 <- Tlinkto ty2
+         | _, Tvar link2 when not (occur_check ty2.typ_level ty2 ty1) ->
+             link2 <- Tlinkto ty1
+-        | Tarrow(t1arg, t1res), Tarrow(t2arg, t2res) ->
++        | Tarrow(t1arg, t1ansa, t1res, t1ansb), 
++	    Tarrow(t2arg, t2ansa, t2res, t2ansb) ->
+             unify (t1arg, t2arg);
+-            unify (t1res, t2res)
++            unify (t1ansa, t2ansa);
++            unify (t1res, t2res);
++            unify (t1ansb, t2ansb)
+         | Tproduct tyl1, Tproduct tyl2 ->
+             unify_list (tyl1, tyl2)
+         | Tconstr(cstr1, []), Tconstr(cstr2, [])
+@@ -281,11 +297,15 @@
+   match type_repr ty with
+     {typ_desc = Tvar link; typ_level = level} ->
+       let ty1 = {typ_desc = Tvar Tnolink; typ_level = level}
+-      and ty2 = {typ_desc = Tvar Tnolink; typ_level = level} in
+-        link <- Tlinkto {typ_desc = Tarrow(ty1, ty2); typ_level = notgeneric};
+-        (ty1, ty2)
+-  | {typ_desc = Tarrow(ty1, ty2)} ->
+-      (ty1, ty2)
++      and ty2 = {typ_desc = Tvar Tnolink; typ_level = level}
++      and ty3 = {typ_desc = Tvar Tnolink; typ_level = level}
++      and ty4 = {typ_desc = Tvar Tnolink; typ_level = level} in 
++(*      in let ty4 = ty2 in *)
++        link <- Tlinkto {typ_desc = Tarrow(ty1, ty2, ty3, ty4); 
++			 typ_level = notgeneric}; 
++        (ty1, ty2, ty3, ty4)
++  | {typ_desc = Tarrow(ty1, ty2, ty3, ty4)} ->
++      (ty1, ty2, ty3, ty4)
+   | {typ_desc = Tconstr({info = {ty_abbr = Tabbrev(params, body)}}, args)} ->
+       filter_arrow (expand_abbrev params body args)
+   | _ ->
+@@ -321,9 +341,12 @@
+         | Tvar link1, _ when ty1.typ_level != generic
+                            && not(occur_check ty1.typ_level ty1 ty2) ->
+             link1 <- Tlinkto ty2
+-        | Tarrow(t1arg, t1res), Tarrow(t2arg, t2res) ->
++        | Tarrow(t1arg, t1ansa, t1res, t1ansb),
++            Tarrow(t2arg, t2ansa, t2res, t2ansb) ->
+             filter (t1arg, t2arg);
+-            filter (t1res, t2res)
++	    filter (t1ansa, t2ansa);
++            filter (t1res, t2res);
++	    filter (t1ansb, t2ansb)
+         | Tproduct(t1args), Tproduct(t2args) ->
+             filter_list (t1args, t2args)
+         | Tconstr(cstr1, []), Tconstr(cstr2, [])
+@@ -389,7 +412,9 @@
+       let rec check_abbrev seen ty =
+         match (type_repr ty).typ_desc with
+           Tvar _ -> ()
+-        | Tarrow(t1, t2) -> check_abbrev seen t1; check_abbrev seen t2
++        | Tarrow(t1, t2, t3, t4) -> 
++	    check_abbrev seen t1; check_abbrev seen t2;
++	    check_abbrev seen t3; check_abbrev seen t4
+         | Tproduct tlist -> do_list (check_abbrev seen) tlist
+         | Tconstr(c, tlist) ->
+             if memq c seen then
+diff -urN cl75/src/compiler/typing.ml OchaCaml/src/compiler/typing.ml
+--- cl75/src/compiler/typing.ml	1997-06-12 21:18:55.000000000 +0900
++++ OchaCaml/src/compiler/typing.ml	2014-04-14 14:04:07.000000000 +0900
+@@ -45,8 +45,11 @@
+           type_expr_vars := (v,t) :: !type_expr_vars; t
+         end
+       end
+-  | Ztypearrow(arg1, arg2) ->
+-      type_arrow(type_of arg1, type_of arg2)
++  | Ztypearrow(arg1, arg2, arg3, arg4) ->
++      type_arrow(type_of arg1, type_of arg2, type_of arg3, type_of arg4) 
++(*  | Ztypearrow(arg1, arg2) ->
++      let ty_ans = new_type_var() in
++      type_arrow(type_of arg1, ty_ans, type_of arg2, ty_ans) *)
+   | Ztypetuple argl ->
+       type_product(map type_of argl)
+   | Ztypeconstr(cstr_name, args) ->
+@@ -208,10 +211,14 @@
+ 
+ (* Typing of printf formats *)
+ 
++let new_type_ans() = 
++  let t = new_type_var() in (* t.typ_level <- generic; *) t;;
++
+ let type_format loc fmt =
+   let len = string_length fmt in
+   let ty_input = new_type_var()
+-  and ty_result = new_type_var() in
++  and ty_result = new_type_var() 
++  and ty_ans = new_type_ans() in  (* answer_type (not modified) *)
+   let rec skip_args j =
+     if j >= len then j else
+       match nth_char fmt j with
+@@ -226,21 +233,31 @@
+           `%` ->
+             scan_format (succ j)
+         | `s` ->
+-            type_arrow (type_string, scan_format (succ j))
++            type_arrow (type_string, ty_ans, scan_format (succ j), ty_ans)
+         | `c` ->
+-            type_arrow (type_char, scan_format (succ j))
++            type_arrow (type_char, ty_ans, scan_format (succ j), ty_ans)
+         | `d` | `o` | `x` | `X` | `u` ->
+-            type_arrow (type_int, scan_format (succ j))
++            type_arrow (type_int, ty_ans, scan_format (succ j), ty_ans)
+         | `f` | `e` | `E` | `g` | `G` ->
+-            type_arrow (type_float, scan_format (succ j))
++            type_arrow (type_float, ty_ans, scan_format (succ j), ty_ans)
+         | `b` ->
+-            type_arrow (type_bool, scan_format (succ j))
++            type_arrow (type_bool, ty_ans, scan_format (succ j), ty_ans)
+         | `a` ->
+-            let ty_arg = new_type_var() in
+-            type_arrow (type_arrow (ty_input, type_arrow (ty_arg, ty_result)),
+-                        type_arrow (ty_arg, scan_format (succ j)))
++            let ty_arg = new_type_var()
++	    and ty_ans' = new_type_ans() 
++	    and ty_ans'' = new_type_ans()
++	    and ty_ans''' = new_type_ans() in
++            type_arrow (type_arrow (ty_input, ty_ans', 
++				    type_arrow (ty_arg, ty_ans''', 
++						ty_result, ty_ans'''), 
++				    ty_ans'), ty_ans,
++                        type_arrow (ty_arg, ty_ans'', 
++				    scan_format (succ j), ty_ans'), ty_ans)
+         | `t` ->
+-            type_arrow (type_arrow (ty_input, ty_result), scan_format (succ j))
++	    let ty_ans' = new_type_ans() in
++            type_arrow (type_arrow (ty_input, ty_ans',
++				    ty_result, ty_ans'), ty_ans, 
++			scan_format (succ j), ty_ans)
+         | c ->
+             bad_format_letter loc c
+         end
+@@ -258,17 +275,27 @@
+     expr_wrong_type_err expr actual_ty expected_ty
+ ;;
+ 
++let unify_answer_type t1 t2 =
++  try
++    unify (t1, t2)
++  with Unify ->
++    answer_type_err t1 t2
++;;
++
++(* env -> exp -> typ * typ * typ *)
+ let rec type_expr env expr =
+-  let inferred_ty =
++  let (ty_a, inferred_ty, ty_b) =
+   match expr.e_desc with
+     Zident r ->
++      let ty_ans = new_type_ans() in
++      ty_ans,
+       begin match !r with
+           Zglobal glob_desc ->
+             type_instance glob_desc.info.val_typ
+         | Zlocal s ->
+             try
+               let (ty_schema, mut_flag) = assoc s env in
+-                type_instance ty_schema
++                type_instance ty_schema 
+             with Not_found ->
+               try
+                 let glob_desc = find_value_desc(GRname s) in
+@@ -276,58 +303,141 @@
+                   type_instance glob_desc.info.val_typ
+               with Desc_not_found ->
+                 unbound_value_err (GRname s) expr.e_loc
+-      end
+-  | Zconstant cst ->
+-      type_of_structured_constant cst
++      end, ty_ans
++  | Zconstant cst -> 
++      let ty_ans = new_type_ans() in
++      ty_ans, type_of_structured_constant cst, ty_ans
+   | Ztuple(args) ->
+-      type_product(map (type_expr env) args)
+-  | Zconstruct0(cstr) ->
++      let (ty_ans1, ts, ty_ans2) = type_expr_list env args in
++      ty_ans1, type_product ts, ty_ans2
++  | Zconstruct0(cstr) -> 
++      let ty_ans = new_type_ans() in
++      ty_ans,
+       begin match cstr.info.cs_kind with
+         Constr_constant ->
+           type_instance cstr.info.cs_res
+       | _ ->
+           let (ty_res, ty_arg) =
+             type_pair_instance (cstr.info.cs_res, cstr.info.cs_arg) in
+-          type_arrow(ty_arg, ty_res)
+-      end            
++	  let ty_ans = new_type_ans() in
++          type_arrow(ty_arg, ty_ans, ty_res, ty_ans)
++      end, ty_ans
+   | Zconstruct1(cstr, arg) ->
++      let ty_ans = new_type_ans() in
+       begin match cstr.info.cs_kind with
+         Constr_constant ->
+-          constant_constr_err cstr expr.e_loc
+-      | _ ->            
++	  constant_constr_err cstr expr.e_loc
++      | _ ->
++	  let ty_ans = new_type_ans() 
++	  and ty_ans' = new_type_ans() in
+           let (ty_res, ty_arg) =
+             type_pair_instance (cstr.info.cs_res, cstr.info.cs_arg) in
+-          type_expect env arg ty_arg;
+-          ty_res
++          type_expect env arg (ty_ans, ty_arg, ty_ans');
++	  (* バグりそう ... ? *)
++          ty_ans, ty_res, ty_ans'
+       end
+   | Zapply(fct, args) ->
+-      let ty_fct = type_expr env fct in
+-      let rec type_args ty_res = function
+-        [] -> ty_res
+-      | arg1 :: argl ->
+-          let (ty1, ty2) =
+-            try
+-              filter_arrow ty_res
+-            with Unify ->
+-              application_of_non_function_err fct ty_fct in
+-          type_expect env arg1 ty1;
+-          type_args ty2 argl in
+-      type_args ty_fct args
++(*      print_int (list_length args) ; print_newline (); *)
++      if (list_length args = 2 && 
++	  (match fct.e_desc with
++	     | Zident r -> (match !r with
++			      | Zlocal s -> 
++				  if (s = "&&" || s = "&" || 
++				      s = "or" || s = "||")
++				  then
++				    let glob_desc = find_value_desc(GRname s) in
++				      r := Zglobal glob_desc;
++				      true
++				  else false
++			      | Zglobal 
++				  { info = { val_prim = ValuePrim (2, p) }} ->
++				  p = prim__Pandint || p = prim__Porint
++			      | _ -> false) | _ -> false))
++      then
++	(* and と or を特別扱い ... left-to-right & e2 は pure *)
++	begin
++	  let e1 = hd args and e2 = hd (tl args) in
++          let (t1, ty1, t2) = type_expr env e1 in
++	  let t3 = new_type_ans() in
++	    type_expect env e2 (t3, type_bool, t1);
++	    unify_expr e1 type_bool ty1;
++	    unify_answer_type t1 t3;
++	    t3, type_bool, t2
++	end
++      else
++	begin
++	(* バグるかも ... *)
++	let (t1, ty_fct, t2) = type_expr env fct in
++	let rec type_args (t1, ty_res, t2) = function
++            [] -> 
++	      (t1, ty_res, t2)
++	  | arg1 :: argl ->
++              let (ty1, ty2, ty3, ty4) =
++		try
++		  filter_arrow ty_res
++		with Unify ->
++		  application_of_non_function_err fct ty_fct in
++	      let ty_ans = new_type_ans() in
++		(try (unify_answer_type t1 ty4) with
++		   | e -> 
++		       pr_type__output_type stdout ty1; print_newline ();
++		       pr_type__output_type stdout ty2; print_newline ();
++		       pr_type__output_type stdout ty3; print_newline ();
++		       pr_type__output_type stdout ty4; print_newline ();
++		       pr_type__output_type stdout t1; print_newline ();
++		       pr_type__output_type stdout t2; print_newline ();
++		       pr_type__output_type stdout ty_res; print_newline ();
++		       raise e); 
++		type_expect env arg1 (t2, ty1, ty_ans);
++		type_args (ty2, ty3, ty_ans) argl in
++	  type_args (t1, ty_fct, t2) args
++	end
+   | Zlet(rec_flag, pat_expr_list, body) ->
+-      type_expr (type_let_decl env rec_flag pat_expr_list) body
++(*
++      print_int 3; print_newline ();
++      (match pat_expr_list with
++	 | [] -> ()
++	 | (a, e) :: _ -> (match a.p_desc with
++			| Zvarpat _ -> 
++			    (match e.e_desc with
++			       | Zfunction _ -> print_int 5; print_newline ()
++			       | _ -> print_int 6; print_newline ())
++			| _ -> print_int 4; print_newline ()));
++*)
++      (* あ、let = pure の条件、抜けているな ... 
++	 CamlLight の制約だけで十分か ?? *)
++(*      print_string (string_of_bool rec_flag);
++      print_newline (); *)
++      let (env, ty_ans3, ty_ans2) = type_let_decl env rec_flag pat_expr_list in
++      let (ty_ans1, ty, ty_ans3') = type_expr env body in
++      unify_answer_type ty_ans3 ty_ans3';
++      ty_ans1, ty, ty_ans2
+   | Zfunction [] ->
+       fatal_error "type_expr: empty matching"
+   | Zfunction ((patl1,expr1)::_ as matching) ->
++      (* pure *)
+       let ty_args = map (fun pat -> new_type_var()) patl1 in
+-      let ty_res = new_type_var() in
++      let ty_res = new_type_var()
++      and ty_ans = new_type_ans()
++      and ty_ans' = new_type_ans() 
++      and ty_ans'' = new_type_ans() in
+       let tcase (patl, action) =
+         if list_length patl != list_length ty_args then
+           ill_shaped_match_err expr;
+-        type_expect (type_pattern_list patl ty_args @ env) action ty_res in
++        type_expect (type_pattern_list patl ty_args @ env) action 
++	  (ty_ans, ty_res, ty_ans') in
+       do_list tcase matching;
+-      list_it (fun ty_arg ty_res -> type_arrow(ty_arg, ty_res))
+-              ty_args ty_res
+-  | Ztrywith (body, matching) ->
++      (if list_length ty_args = 0 then failwith "empty function");
++      let (ty_arg, ty_args') = 
++	let rev_args = rev ty_args in hd rev_args, rev (tl rev_args) in
++      ty_ans'',
++      list_it (fun ty_arg ty_res ->
++		 let ty_ans = new_type_ans() in
++		 type_arrow(ty_arg, ty_ans, ty_res, ty_ans))
++              ty_args' (type_arrow (ty_arg, ty_ans, ty_res, ty_ans')),
++      ty_ans''
++  | Ztrywith (body, matching) -> 
++      (* わかんないから放置 ... まずそう ... *)
+       let ty = type_expr env body in
+       do_list
+         (fun (pat, expr) ->
+@@ -335,61 +445,85 @@
+         matching;
+       ty
+   | Zsequence (e1, e2) ->
+-      type_statement env e1; type_expr env e2
++      let (ty_ans1, ty_ans2) = type_statement env e1 in
++      let (ty_ans2', ty, ty_ans3) = type_expr env e2 in
++      unify_answer_type ty_ans2 ty_ans2';
++      ty_ans1, ty, ty_ans3
+   | Zcondition (cond, ifso, ifnot) ->
+-      type_expect env cond type_bool;
++      let ty_ans1 = new_type_ans()
++      and ty_ans2 = new_type_ans() in
++      type_expect env cond (ty_ans1, type_bool, ty_ans2);
+       if match ifnot.e_desc
+          with Zconstruct0 cstr -> cstr == constr_void | _ -> false
+       then begin
+-        type_expect env ifso type_unit;
+-        type_unit
++	let ty_ans3 = new_type_ans() in 
++        type_expect env ifso (ty_ans3, type_unit, ty_ans1);
++        ty_ans3, type_unit, ty_ans2
+       end else begin
+-        let ty = type_expr env ifso in
+-        type_expect env ifnot ty;
+-        ty
++        let (ty_ans3, ty, ty_ans1') = type_expr env ifso in
++        type_expect env ifnot (ty_ans3, ty, ty_ans1');
++	unify_answer_type ty_ans1 ty_ans1';
++        ty_ans3, ty, ty_ans2
+       end
+   | Zwhen (cond, act) ->
+-      type_expect env cond type_bool;
+-      type_expr env act
++      let ty_ans1 = new_type_ans() in
++      let (ty_ans2, ty, ty_ans3) = type_expr env act in
++      type_expect env cond (ty_ans3, type_bool, ty_ans1);
++      ty_ans2, ty, ty_ans1
+   | Zwhile (cond, body) ->
+-      type_expect env cond type_bool;
+-      type_statement env body;
+-      type_unit
++      let (ty_ans1, ty_ans1') = type_statement env body in
++      unify_answer_type ty_ans1 ty_ans1';
++      type_expect env cond (ty_ans1, type_bool, ty_ans1);
++      ty_ans1, type_unit, ty_ans1
+   | Zfor (id, start, stop, up_flag, body) ->
+-      type_expect env start type_int;
+-      type_expect env stop type_int;
+-      type_statement ((id,(type_int,Notmutable)) :: env) body;
+-      type_unit
++      let ty_ans1 = new_type_ans() 
++      and ty_ans2 = new_type_ans() 
++      and ty_ans3 = new_type_ans() in
++      type_expect env start (ty_ans3, type_int, ty_ans2);
++      type_expect env stop (ty_ans1, type_int, ty_ans3);
++      let (ty_ans1', ty_ans1'') = 
++	type_statement ((id,(type_int,Notmutable)) :: env) body in
++      unify_answer_type ty_ans1 ty_ans1';
++      unify_answer_type ty_ans1 ty_ans1'';
++      ty_ans1, type_unit, ty_ans2
+   | Zconstraint (e, ty_expr) ->
++      let ty_ans = new_type_ans() in
+       let ty' = type_of_type_expression false ty_expr in
+-      type_expect env e ty';
+-      ty'
++      type_expect env e (ty_ans, ty', ty_ans);
++      ty_ans, ty', ty_ans
+   | Zvector elist ->
+       let ty_arg = new_type_var() in
+-      do_list (fun e -> type_expect env e ty_arg) elist;
+-      type_vect ty_arg
++      let (ty_ans1, tlist, ty_ans2) = type_expr_list env elist in
++      do_list2 (fun t e -> unify_expr e ty_arg t) tlist elist;
++      ty_ans1, (type_vect ty_arg), ty_ans2 
+   | Zassign(id, e) ->
+       begin try
+         match assoc id env with
+           (ty_schema, Notmutable) ->
+             not_mutable_err id expr.e_loc
+         | (ty_schema, Mutable) ->
+-            type_expect env e (type_instance ty_schema);
+-            type_unit
++	    let ty_ans1 = new_type_ans() 
++	    and ty_ans2 = new_type_ans() in
++            type_expect env e (ty_ans1, (type_instance ty_schema), ty_ans2);
++            ty_ans1, type_unit, ty_ans2
+       with Not_found ->
+         unbound_value_err (GRname id) expr.e_loc
+       end
+   | Zrecord lbl_expr_list ->
+       let ty = new_type_var() in
+-      do_list
+-        (fun (lbl, exp) ->
+-          let (ty_res, ty_arg) =
+-            type_pair_instance (lbl.info.lbl_res, lbl.info.lbl_arg) in
+-          begin try unify (ty, ty_res)
+-          with Unify -> label_not_belong_err expr lbl ty
+-          end;
+-          type_expect env exp ty_arg)
+-        lbl_expr_list;
++      let rec loop = function
++	| [] -> let ty_ans = new_type_ans() in ty_ans, ty_ans
++	| (lbl, exp) :: rest -> 
++	    let (ty_ans1, ty_ans2) = loop rest in
++	    let ty_ans3 = new_type_ans() in
++            let (ty_res, ty_arg) =
++              type_pair_instance (lbl.info.lbl_res, lbl.info.lbl_arg) in
++            begin try unify (ty, ty_res)
++            with Unify -> label_not_belong_err expr lbl ty
++            end;
++            type_expect env exp (ty_ans3, ty_arg, ty_ans1);
++	    ty_ans3, ty_ans2 in
++      let (ty_ans1, ty_ans2) = loop lbl_expr_list in
+       let label = vect_of_list (labels_of_type ty) in
+       let defined = make_vect (vect_length label) false in
+       do_list (fun (lbl, exp) ->
+@@ -401,55 +535,138 @@
+       for i = 0 to vect_length label - 1 do
+         if not defined.(i) then label_undefined_err expr label.(i)
+       done;
+-      ty
++      ty_ans1, ty, ty_ans2
+   | Zrecord_access (e, lbl) ->
++      let ty_ans1 = new_type_ans()
++      and ty_ans2 = new_type_ans() in
+       let (ty_res, ty_arg) =
+         type_pair_instance (lbl.info.lbl_res, lbl.info.lbl_arg) in
+-      type_expect env e ty_res;
+-      ty_arg      
++      type_expect env e (ty_ans1, ty_res, ty_ans2);
++      ty_ans1, ty_arg, ty_ans2
+   | Zrecord_update (e1, lbl, e2) ->
++      let ty_ans1 = new_type_ans() 
++      and ty_ans2 = new_type_ans() 
++      and ty_ans3 = new_type_ans() in
+       let (ty_res, ty_arg) =
+         type_pair_instance (lbl.info.lbl_res, lbl.info.lbl_arg) in
+       if lbl.info.lbl_mut == Notmutable then label_not_mutable_err expr lbl;
+-      type_expect env e1 ty_res;
+-      type_expect env e2 ty_arg;
+-      type_unit
++      type_expect env e1 (ty_ans1, ty_res, ty_ans2);
++      type_expect env e2 (ty_ans2, ty_arg, ty_ans3);
++      ty_ans1, type_unit, ty_ans3
+   | Zstream complist ->
++      (* on demand で実行するから、answer type は関係ない ?? *)
+       let ty_comp = new_type_var() in
+       let ty_res = type_stream ty_comp in
++      let ty_ans1 = new_type_ans() 
++      and ty_ans2 = new_type_ans() in
+       do_list
+-        (function Zterm e -> type_expect env e ty_comp
+-                | Znonterm e -> type_expect env e ty_res)
++        (function Zterm e -> 
++	            type_expect env e (ty_ans1, ty_comp, ty_ans2)
++                | Znonterm e -> 
++		    type_expect env e (ty_ans1, ty_res, ty_ans2))
+         complist;
+-      ty_res
++      ty_ans1, ty_res, ty_ans2
+   | Zparser casel ->
++      (* よくわからん ... stream が ... *)
+       let ty_comp = new_type_var() in
+       let ty_stream = type_stream ty_comp in
+       let ty_res = new_type_var() in
++      let ty_ans1 = new_type_ans() 
++      and ty_ans2 = new_type_ans() 
++(*      and ty_ans1' = new_type_var() 
++      and ty_ans2' = new_type_var() *) in
+       let rec type_stream_pat new_env = function
+         ([], act) ->
+-          type_expect (new_env @ env) act ty_res
++          type_expect (new_env @ env) act (ty_ans1, ty_res, ty_ans2)
+       | (Ztermpat p :: rest, act) ->
+           type_stream_pat (tpat new_env (p, ty_comp, Notmutable)) (rest,act)
+       | (Znontermpat(parsexpr, p) :: rest, act) ->
+           let ty_parser_result = new_type_var() in
+           type_expect (new_env @ env) parsexpr
+-                      (type_arrow(ty_stream, ty_parser_result));
++                      (ty_ans1, 
++		       type_arrow(ty_stream, ty_ans1,
++				  ty_parser_result, ty_ans2),
++		       ty_ans2);
+           type_stream_pat (tpat new_env (p, ty_parser_result, Notmutable))
+                           (rest,act)
+       | (Zstreampat s :: rest, act) ->
+           type_stream_pat ((s, (ty_stream, Notmutable)) :: new_env) (rest,act)
+       in
+       do_list (type_stream_pat [])  casel;
+-      type_arrow(ty_stream, ty_res)
++      ty_ans1, type_arrow(ty_stream, ty_ans1, ty_res, ty_ans2), ty_ans2
++
++  | Zshift ({ p_desc = Zvarpat id } as pat1, pat2, exp) -> 
++      (* ∀t.('t/t ->'a/t) の表現がこれでいいのか疑問 ... *)
++      let ty_ans = new_type_ans() 
++      and ty_arg = new_type_var()
++      and ty_res = new_type_var() in
++      ty_ans.typ_level <- generic;
++      let ty_arr = type_arrow (ty_arg, ty_ans, ty_res, ty_ans) in
++(*      generalize_type ty_ans;  *)
++      ty_arr.typ_level <- generic;
++      (* answer type polymorphic *)
++      ty_ans.typ_level <- generic; 
++      pat1.p_typ <- ty_arr;
++      let (ty_ans1, ty', ty_ans2) = 
++	type_expr ((id, (pat1.p_typ, Notmutable)) :: env) exp in
++      unify_answer_type ty_ans1 ty';
++      pat2.p_typ <- type_arrow (ty_arr, ty', ty', ty_ans2);
++      ty_res, ty_arg, ty_ans2
++
++  | Zshift _ -> failwith "not happend"
++  | Zreset (pat, exp) ->
++      (* これでいいのかなぁ ... ?? *)
++      let (ty_ans1, ty, ty_ans2) = type_expr env exp in
++      let ty_ans = new_type_ans() in
++(*      ty_ans.typ_level <- generic; *)
++      (* 型エラーメッセージ変更のため *)
++      unify_expr exp ty ty_ans1;
++      ty_ans, ty_ans2, ty_ans
++(*      pat.p_typ <- type_arrow (type_unit, ty_ans2, ty, ty_ans2);*)
++(*    unify_pat pat (type_arrow (type_unit, ty_ans2, ty, ty_ans2)) pat.p_typ; *)
++(*
++env; 's |- e : 's; 't
++---------------------
++env |-p reset e : 't
++
++
++env; 's |- e : unit -> 's; 't
++-----------------------------
++env |- reset e : 't
++*)
++(*
++  | Zshift (id, exp) -> 
++      (* ∀t.('t/t ->'a/t) の表現がこれでいいのか疑問 ... *)
++      let ty_ans = new_type_var() 
++      and ty_arg = new_type_var()
++      and ty_res = new_type_var() in
++      generalize_type ty_ans;
++      let ty_arr = type_arrow (ty_arg, ty_ans, ty_res, ty_ans) in
++      let (ty_ans1, ty, ty_ans2) = 
++	type_expr ((id, (ty_arr, Notmutable)) :: env) exp in
++      unify_answer_type ty_ans1 ty;
++      ty_res, ty_arg, ty_ans2
++  | Zreset exp -> 
++      let (ty_ans1, ty, ty_ans2) = type_expr env exp in
++      let ty_ans = new_type_var() in
++      unify_expr expr ty ty_ans1;
++      ty_ans, ty_ans2, ty_ans *)
+   in
+     expr.e_typ <- inferred_ty;
+-    inferred_ty
++    ty_a, inferred_ty, ty_b
++(* typing for list (right-to-left) *)
++and type_expr_list env = function
++  | [] -> let ty_ans = new_type_ans() in ty_ans, [], ty_ans
++  | e :: es -> 
++      let (t1, t, t2) = type_expr env e in
++      let (t2', ts, t3) = type_expr_list env es in
++      unify_answer_type t2 t2';
++      t1, (t :: ts), t3
+ 
+ (* Typing of an expression with an expected type.
+    Some constructs are treated specially to provide better error messages. *)
+ 
+-and type_expect env exp expected_ty =
++and type_expect env exp (ty_ans1, expected_ty, ty_ans2) =
+   match exp.e_desc with
+     Zconstant(SCatom(ACstring s)) ->
+       let actual_ty =
+@@ -461,25 +678,44 @@
+             else type_string
+         | _ ->
+             type_string in
++      unify_answer_type ty_ans1 ty_ans2;
+       unify_expr exp expected_ty actual_ty
+   | Zlet(rec_flag, pat_expr_list, body) ->
+-      type_expect (type_let_decl env rec_flag pat_expr_list) body expected_ty
++      let (env, ty_ans3, ty_ans2') = 
++	type_let_decl env rec_flag pat_expr_list in
++      unify_answer_type ty_ans2 ty_ans2';
++      type_expect env body (ty_ans1, expected_ty, ty_ans3)
+   | Zsequence (e1, e2) ->
+-      type_statement env e1; type_expect env e2 expected_ty
++      let (ty_ans3, ty_ans2') = type_statement env e1 in 
++      unify_answer_type ty_ans2 ty_ans2';
++      type_expect env e2 (ty_ans1, expected_ty, ty_ans3)
+   | Zcondition (cond, ifso, ifnot) ->
+-      type_expect env cond type_bool;
+-      type_expect env ifso expected_ty;
+-      type_expect env ifnot expected_ty
++      let ty_ans3 = new_type_ans() in
++      type_expect env cond (ty_ans3, type_bool, ty_ans2);
++      type_expect env ifso (ty_ans1, expected_ty, ty_ans3);
++      type_expect env ifnot (ty_ans1, expected_ty, ty_ans3)
+   | Ztuple el ->
++      let ty_ans1_ref = ref ty_ans1
++      and ty_ans2_ref = ref (new_type_ans()) in
+       begin try
+-        do_list2 (type_expect env)
+-                 el (filter_product (list_length el) expected_ty)
++        do_list2 (fun e ty ->
++		    type_expect env e (!ty_ans1_ref, ty, !ty_ans2_ref);
++		    ty_ans1_ref := !ty_ans2_ref;
++		    ty_ans2_ref := new_type_ans())
++                 el (filter_product (list_length el) expected_ty);
++	unify_answer_type !ty_ans1_ref ty_ans2
+       with Unify ->
+-        unify_expr exp expected_ty (type_expr env exp)
++	let (ty_ans1', ty, ty_ans2') = type_expr env exp in
++        unify_expr exp expected_ty ty;
++	unify_answer_type ty_ans1 ty_ans1';
++	unify_answer_type ty_ans2 ty_ans2'
+       end
+ (* To do: try...with, match...with ? *)
+   | _ ->
+-      unify_expr exp expected_ty (type_expr env exp)
++      let (ty_ans1', ty, ty_ans2') = type_expr env exp in
++      unify_answer_type ty_ans1' ty_ans1;
++      unify_answer_type ty_ans2' ty_ans2;
++      unify_expr exp expected_ty ty
+   
+ (* Typing of "let" definitions *)
+ 
+@@ -493,25 +729,113 @@
+   typing_let := false;
+   let new_env =
+     add_env @ env in
++  let env' = if rec_flag then new_env else env in
++  (* 継続つなげてみたけど ... (let x = ... の形のときだけ) *)
++  let ty_ans2 = new_type_ans() in
++  let ty_ans1_ref = ref (new_type_ans())
++  and ty_ans2_ref = ref ty_ans2 in 
+   do_list2
++    (if rec_flag
++     then (fun (pat, exp) ty -> 
++	     type_expect env' exp (new_type_ans(), ty, new_type_ans()))
++     else (fun (pat, exp) ty -> 
++	     (match exp.e_desc with
++		| Zfunction _ -> 
++		    type_expect env' exp (new_type_ans(), ty, new_type_ans())
++		| _ ->
++		    type_expect env' exp (!ty_ans1_ref, ty, !ty_ans2_ref);
++		    ty_ans2_ref := !ty_ans1_ref;
++		    ty_ans1_ref := new_type_ans()))) pat_expr_list ty_list;
++(*
++  let ty_ans1 = new_type_var() in
++  let ty_ans1_ref = ref ty_ans1
++  and ty_ans2_ref = ref (new_type_var()) in
++  do_list2 
++    (if rec_flag 
++     then (fun (pat, exp) ty -> 
++	     type_expect env' exp (new_type_var (), ty, new_type_var ()))
++     else (fun (pat, exp) ty ->
++	     (match exp.e_desc with
++		| Zfunction _ ->
++		    type_expect env' exp (new_type_var(), ty, new_type_var()) 
++		| _ ->  
++		    type_expect env' exp (!ty_ans1_ref, ty, !ty_ans2_ref); 
++		    ty_ans1_ref := !ty_ans2_ref;
++		    ty_ans2_ref := new_type_var()))) pat_expr_list ty_list;
++*)
++(*
++    if rec_flag 
++    then (do_list2 (fun (pat, exp) ty -> type_expect env' exp (new_type_var (), ty, new_type_var ())) pat_expr_list ty_list)
++ else do_list2
+     (fun (pat, exp) ty ->
+-        type_expect (if rec_flag then new_env else env) exp ty)
+-    pat_expr_list ty_list;
++       (match exp.e_desc with
++	  | Zfunction _ ->
++	      type_expect env' exp (new_type_var(), ty, new_type_var()) 
++	  | _ ->  
++	      type_expect env' exp (!ty_ans1_ref, ty, !ty_ans2_ref); 
++	      ty_ans1_ref := !ty_ans2_ref;
++	      ty_ans2_ref := new_type_var()))
++    pat_expr_list ty_list; *)
+   pop_type_level();
+   let gen_type =
+     map2 (fun (pat, expr) ty -> (is_nonexpansive expr, ty))
+          pat_expr_list ty_list in
+   do_list (fun (gen, ty) -> if not gen then nongen_type ty) gen_type;
+   do_list (fun (gen, ty) -> if gen then generalize_type ty) gen_type;
+-  new_env
++  new_env, !ty_ans2_ref, ty_ans2 (* ty_ans1, !ty_ans1_ref *)
+ 
+ (* Typing of statements (expressions whose values are ignored) *)
+ 
+ and type_statement env expr =
+-  let ty = type_expr env expr in
+-  match (type_repr ty).typ_desc with
+-  | Tarrow(_,_) -> partial_apply_warning expr.e_loc
+-  | Tvar _ -> ()
+-  | _ ->
+-      if not (same_base_type ty type_unit) then not_unit_type_warning expr ty
++  let (ty_ans1, ty, ty_ans2) = type_expr env expr in
++  (match (type_repr ty).typ_desc with
++    | Tarrow(_,_,_,_) -> partial_apply_warning expr.e_loc
++    | Tvar t -> () (* t <- Tlinkto type_unit *)
++    | _ ->
++	if not (same_base_type ty type_unit) 
++	then not_unit_type_warning expr ty);
++  ty_ans1, ty_ans2
+ ;;
++
++
++
++(*
++	      print_string (match exp.e_desc with
++			      | Zident _ -> "ident"
++			      | Zconstant _ -> "const"
++			      | Ztuple _ -> "tuple"
++			      | Zconstruct0 _ -> "construct0"
++			      | Zconstruct1 _ -> "construct1"
++			      | Zapply _ -> "app"
++			      | Zlet _ -> "let"
++			      | Zfunction _ -> "fun"
++			      | Ztrywith _ -> "try with"
++			      | Zsequence _ -> "seq"
++			      | Zcondition _ -> "cond"
++			      | Zwhile _ -> "while"
++			      | Zfor _ -> "for"
++			      | Zconstraint _ -> "constraint"
++			      | Zvector _ -> "vect (array)"
++			      | Zassign _ -> "assign"
++			      | Zrecord _ -> "record"
++			      | Zrecord_access _ -> "reco_access"
++			      | Zrecord_update _ -> "reco_update"
++			      | Zstream _ -> "stream"
++			      | Zparser _ -> "parser"
++			      | Zwhen _ -> "when"
++			      | Zshift _ -> "shift"
++			      | Zreset _ -> "reset"); 
++	      print_newline ();
++	      print_string (match pat.p_desc with
++			      | Zwildpat -> "wiled pat"
++			      | Zvarpat _ -> "vars"
++			      | Zaliaspat _ -> "alias"
++			      | Zconstantpat _ -> "const"
++			      | Ztuplepat _ -> "tuple"
++			      | Zconstruct0pat _ -> "construct0"
++			      | Zconstruct1pat _ -> "construct1"
++			      | Zorpat _ -> "or"
++			      | Zconstraintpat _ -> "constraint"
++			      | Zrecordpat _ -> "record");
++	      print_newline ();
++*)
+diff -urN cl75/src/lib/int.ml OchaCaml/src/lib/int.ml
+--- cl75/src/lib/int.ml	1996-12-05 18:30:30.000000000 +0900
++++ OchaCaml/src/lib/int.ml	2014-04-14 14:04:07.000000000 +0900
+@@ -10,7 +10,7 @@
+   n lxor (-1)
+ ;;
+ 
+-let string_of_int = format_int "%ld";;
++let string_of_int n = format_int "%ld" n;;
+ 
+ let min_int = 1 lsl (if 1 lsl 31 = 0 then 30 else 62);;
+ let max_int = min_int - 1;;
+diff -urN cl75/src/lib/printexc.ml OchaCaml/src/lib/printexc.ml
+--- cl75/src/lib/printexc.ml	1994-12-22 19:24:04.000000000 +0900
++++ OchaCaml/src/lib/printexc.ml	2014-04-14 14:04:07.000000000 +0900
+@@ -40,7 +40,7 @@
+           input_value ic;
+           input_value ic;
+           let tag_exn_table = (input_value ic : (qualid * int) vect) in
+-          close_in ic;
++          close_in ic; 
+           if tag >= vect_length tag_exn_table then raise Exit;
+           let (q,s) = tag_exn_table.(tag) in
+           prerr_string q.qual;
+diff -urN cl75/src/runtime/compare.c OchaCaml/src/runtime/compare.c
+--- cl75/src/runtime/compare.c	1994-11-22 23:10:46.000000000 +0900
++++ OchaCaml/src/runtime/compare.c	2014-04-14 14:04:07.000000000 +0900
+@@ -46,6 +46,7 @@
+   case Final_tag:
+     invalid_argument("equal: abstract value");
+   case Closure_tag:
++  case Cont_tag:
+     invalid_argument("equal: functional value");
+   default: {
+     mlsize_t sz1 = Wosize_val(v1);
+diff -urN cl75/src/runtime/debugcom.c OchaCaml/src/runtime/debugcom.c
+--- cl75/src/runtime/debugcom.c	1997-06-27 22:59:02.000000000 +0900
++++ OchaCaml/src/runtime/debugcom.c	2014-04-14 14:05:07.000000000 +0900
+@@ -182,7 +182,7 @@
+   value val;
+   value * p;
+ 
+-  if (dbg_socket == -1) return;  /* Not connected to a debugger. */
++  if (dbg_socket == -1) return 0;  /* Not connected to a debugger. */
+ 
+   /* Report the event to the debugger */
+   switch(event) {
+diff -urN cl75/src/runtime/fail.c OchaCaml/src/runtime/fail.c
+--- cl75/src/runtime/fail.c	1995-03-07 23:17:29.000000000 +0900
++++ OchaCaml/src/runtime/fail.c	2014-04-14 14:04:07.000000000 +0900
+@@ -54,3 +54,8 @@
+ {
+   mlraise(Atom(OUT_OF_MEMORY_EXN));
+ }
++
++void raise_without_reset()
++{
++  failwith ("shift is executed without enclosing reset");
++}
+diff -urN cl75/src/runtime/fail.h OchaCaml/src/runtime/fail.h
+--- cl75/src/runtime/fail.h	1995-04-27 00:07:38.000000000 +0900
++++ OchaCaml/src/runtime/fail.h	2014-04-14 14:04:07.000000000 +0900
+@@ -32,5 +32,6 @@
+ void failwith P((char *));
+ void invalid_argument P((char *));
+ void raise_out_of_memory P((void));
++void raise_without_reset P((void));
+ 
+ #endif /* _fail_ */
+diff -urN cl75/src/runtime/instruct.h OchaCaml/src/runtime/instruct.h
+--- cl75/src/runtime/instruct.h	1994-11-10 19:05:11.000000000 +0900
++++ OchaCaml/src/runtime/instruct.h	2014-04-14 14:04:07.000000000 +0900
+@@ -125,7 +125,11 @@
+   VECTLENGTH,
+   GETVECTITEM,
+   SETVECTITEM,
+-  BREAK
++  BREAK, 
++  SHIFT,
++  RESET,
++  ENDSHIFTRESET,
++  COPYBLOCKS
+ };
+ 
+ enum float_instructions {
+diff -urN cl75/src/runtime/interp.c OchaCaml/src/runtime/interp.c
+--- cl75/src/runtime/interp.c	1997-06-27 22:59:03.000000000 +0900
++++ OchaCaml/src/runtime/interp.c	2014-04-14 14:04:07.000000000 +0900
+@@ -86,6 +86,8 @@
+     retsp->cache_size = cache_size;					     \
+     *--asp = accu;							     \
+     extern_asp = asp; extern_rsp = rsp;					     \
++    extern_rp = rp; 							     \
++    extern_rp_a = rp_a; 						     \
+   }
+ 
+ #define Restore_after_gc						     \
+@@ -102,6 +104,7 @@
+     retsp->cache_size = cache_size;                                          \
+     extern_asp = asp;                                                        \
+     extern_rsp = rsp;                                                        \
++    extern_rp = rp; 							     \
+   }
+ #define Restore_after_c_call                                                 \
+   { asp = extern_asp;                                                        \
+@@ -190,19 +193,34 @@
+   int cache_size;
+   value env;
+   value tmp;
++  value rp;
++  value rp_a;
+   struct longjmp_buffer * initial_external_raise;
+   int initial_rsp_offset;
+   value * initial_c_roots_head;
+   struct longjmp_buffer raise_buf;
+ 
++  int flg = 0;
++
+ #ifdef DIRECT_JUMP
+   static void * jumptable[] = {
+ #   include "jumptbl.h"
+   };
+ #endif
+ 
++#ifdef CAML_SIXTYFOUR
++  static word_size = 8;
++#else
++  static word_size = 4;
++#endif
++
+   asp = extern_asp;
+   rsp = extern_rsp;
++  // とりあえず、始めは rsp の bottom かな ? と思ったものの、;; のあとに rsp に
++  // されるとまずいので、0 にしておく。
++  // # そもそも reset が抜けたら実行出来ない、という仕様。
++  rp = (value) 0;
++  rp_a = (value) 0;
+   pc = prog;
+   env = null_env;
+   cache_size = 0;
+@@ -268,6 +286,14 @@
+       
+     Instruct(APPLY):
+     apply:
++      { int i; 
++	if (flg == -2) {
++	for (i = -10; i < 11; i++) 
++	  printf ("apc%3d(%d): %d\n", i, rsp+i, *(rsp+i));
++	}
++      if (flg == -1) 
++	printf ("tpa (%d): %d, %d, %d, %d, %d\n", 
++		tp, tp->pc, tp->env, tp->cache_size, tp->asp, tp->tp); 
+       push_ret_frame();
+       retsp->pc = pc;
+       retsp->env = env;
+@@ -276,9 +302,23 @@
+       cache_size = 1;
+       pc = Code_val(accu);
+       env = Env_val(accu);
++      if (flg == -1)
++	printf ("tp (%d): %d, %d, %d, %d, %d\n", 
++		tp, tp->pc, tp->env, tp->cache_size, tp->asp, tp->tp); 
++      if (flg == 2) { printf ("%d, %d\n", pc, env); }
+       goto check_stacks;
+-      
++      }
+     Instruct(RETURN):
++      if (flg == 2) {
++	printf ("now return! (cache size: %d)\n", cache_size);
++	int i;
++	for (i = -20; i < 21; i++) printf ("ret(%3d): %d\n", i, *(rsp + i));
++	printf ("%d\n", *asp);
++      }
++    ret:
++      if (flg == -101) {
++	if (*asp == MARK) printf ("MARK!\n");
++	else printf ("not MARK!\n"); }
+       if (*asp == MARK) {
+ 	rsp += cache_size;
+ 	asp++;
+@@ -286,6 +326,12 @@
+ 	env = retsp->env;
+ 	cache_size = retsp->cache_size;
+ 	pop_ret_frame();
++	if (flg == 2) {
++	  printf ("accu: %d\n", (accu - 1) / 2);
++	  printf ("pc: %d, cache: %d\n", pc, cache_size);
++	  int i; 
++	  for (i = -10; i < 11; i++) printf ("ret(%3d): %d\n", i, *(rsp+i));
++	}
+         if (something_to_do) goto process_signal;
+ 	Next;
+       }
+@@ -305,6 +351,8 @@
+         realloc_stacks();
+         rsp = extern_rsp;
+         asp = extern_asp;
++	rp = extern_rp;
++	rp_a = extern_rp_a;
+         Restore_after_gc;
+       }
+       /* fall through CHECK_SIGNALS */
+@@ -396,8 +444,8 @@
+     Instruct(ACC5):
+       accu = access(5); Next;
+     Instruct(ACCESS):
+-      { int n = *pc++;
+-	accu = access(n);
++      {	int n = *pc++;
++	accu = access(n); 
+ 	Next;
+       }
+       
+@@ -473,7 +521,8 @@
+     Instruct(PUSHTRAP):
+       { value * src = rsp + cache_size;
+ 	int i = cache_size;
+-	
++	int j = pc + s16pc;
++
+ 	push_trap_frame();
+ 	trapsp->pc = pc + s16pc;
+ 	pc += SHORT;
+@@ -481,6 +530,12 @@
+ 	trapsp->cache_size = cache_size + 2;
+ 	trapsp->asp = asp;
+ 	trapsp->tp = tp;
++	if (flg == -1) {
++	  printf ("... %d, %d, %d, %d, %d\n", 
++		  j, env, cache_size + 2, asp, tp);
++	  for (j = -10; j < 11; j++) 
++	    printf ("pushtrap%3d(%d): %d\n", j, j + asp, *(j + asp));
++	}
+ 	tp = trapsp;
+ 	while(i--) *--rsp = *--src;
+ 	*--asp = MARK;
+@@ -490,6 +545,14 @@
+     raise:			/* An external raise jumps here */
+ 
+     Instruct(RAISE):
++      if (flg == -101) printf ("raise!\n");
++      if (flg == -1) { 
++	int i;
++	printf ("tp (%d): %d, %d, %d, %d, %d\n", 
++		tp, tp->pc, tp->env, tp->cache_size, tp->asp, tp->tp); 
++	for (i = -10; i < 11; i++) 
++	  printf ("%3d(%d): %d\n", i, i + tp->asp, *(i + tp->asp));
++      }
+       if ((value *) tp >= trap_barrier) debugger(TRAP_BARRIER);
+       rsp = (value *) tp;
+       if (rsp >= (value *)((char *) ret_stack_high - initial_rsp_offset)) {
+@@ -497,6 +560,16 @@
+         external_raise = initial_external_raise;
+         longjmp(external_raise->buf, 1);
+       }
++      // reset pointers を巻き戻す 
++      // value * tmp;
++      if (rp < rsp && rp != 0) {
++	value * tmp = rp;
++	rp = *(tmp - 1);
++	tmp = rp_a; rp_a = *(tmp - 1);
++	// rp = *(rp - 1);
++	/*	tmp = rp; rp = *(tmp - 1);
++		tmp = rp_a; rp_a = *(tmp - 1); */
++      } 
+       pc = trapsp->pc;
+       env = trapsp->env;
+       cache_size = trapsp->cache_size - 2;
+@@ -505,9 +578,12 @@
+       pop_trap_frame();
+       *--rsp = accu;
+       cache_size++;
++      if (flg == -1) printf ("%d, %d, %d, %d, %d\n", 
++			     pc, env, cache_size, asp, tp);
+       Next;
+       
+     Instruct(POPTRAP):
++      if (flg == -101) printf ("poptrap!\n");
+       if (something_to_do) {
+         /* We must check here so that if a signal is pending and its
+            handler triggers an exception, the exception is trapped
+@@ -756,13 +832,17 @@
+       accu = Val_long((accu - 1) / tmp);
+       Next;
+     Instruct(MODINT):
++      {
++	/* if (flg == 1) 
++	  for (i = -20; i < 21; i++) 
++	  printf ("??%d(%3d): %3d\n", pc+i, i, *(pc+i)); */
+       tmp = *asp++ - 1;
+       if (tmp == 0) {
+         accu = Atom(ZERO_DIVIDE_EXN);
+         goto raise;
+       }
+       accu = 1 + (accu - 1) % tmp;
+-      Next;
++      Next; }
+     Instruct(ANDINT):
+       accu &= *asp++; Next;
+     Instruct(ORINT):
+@@ -908,6 +988,313 @@
+       tmp = Long_val(*asp++);
+       goto setfield;
+ 
++    Instruct(RESET):
++      { int i;
++	// for (i = -10; i < 21; i++) printf("%3d: %d\n", i, *(rsp + i));
++	flg = 1;
++	flg = -102;
++	//	flg = -1;
++	// *--asp = MARK;
++	*--asp = rp_a;
++	rp_a = asp + 1;
++	push_ret_frame();
++	retsp->pc = pc;
++	retsp->env = env;
++	retsp->cache_size = cache_size;
++	//	printf ("rsp (reset): %d\n", rsp);
++	*--rsp = rp;		// rp 保存
++	if (flg == 3) 
++	  printf ("\t\t*** reset mark !! *** %d ***\n", rp);
++	//	printf ("rp: %d, ", rp);
++	rp = rsp + 1;		// 現在の rsp で rp 更新
++	//	extern_rp = rp;
++	//	printf ("rsp?: %d\n", rp);
++	//	rp = rsp + 1;
++	//	*rp = *rsp;
++	//printf ("rsp?: %d\n", *rp);
++	// for (i = -10; i < 21; i++) printf ("%3d?: %d\n", i, *(rsp + i));
++	cache_size = 0; // 1
++	pc = Code_val(accu);
++	env = Env_val(accu);
++	if (flg == 3) {
++	  for (i = -10; i < 11; i++) printf("1rr%3d: %d\n", i, *(rsp + i)); }
++	goto check_stacks; }
++    Instruct(ENDSHIFTRESET):
++      { int i = 0;
++	// printf ("tp: %d, %d\n", tp, rsp);
++	if (flg == -101) printf ("end shift/reset1!!\n");
++	if (flg == 3) 
++	  for (i = -10; i < 11; i++) printf("%3dc: %d\n", i, *(rsp + i));
++	i = 0;
++	if (flg >= 3) { printf("end of shift or reset !\n"); }
++	// while (*asp != RESETMARK) { asp++; i++; }
++	if (flg >= 3) { printf ("accu: %d\n", (accu - 1) / 2); } 
++	asp = rp_a;
++	rp_a = *(asp - 1);
++	// asp++;
++	//	printf ("*** rp ... %d, ", rp);
++	rsp = rp;
++	//	printf ("*** rsp!: %d, ", rsp);
++	rp = *(rsp - 1);
++	//	extern_rp = rp;
++	//rsp++;
++	//	printf ("*** rp! %d\n", rp);
++	if (flg >= 3) { printf ("cache_size: %d\n", cache_size); } 
++	//rsp++;
++	cache_size = 0;
++	//for (i = -5; i < 6; i++) printf ("cc%3dcc: %d\n", i, *(i + rsp));
++	if (flg == -101) {
++	  printf ("end shift/reset2!!\n");
++	  printf ("pc: %d, env: %d, asp: %d, rsp: %d\n", pc, env, asp, rsp);
++	  printf ("tp (%d): %d, %d, %d, %d, %d\n", 
++		  tp, tp->pc, tp->env, tp->cache_size, tp->asp, tp->tp); }
++	Next;
++      }
++    Instruct(SHIFT):
++      { int i, j, tmp1, tmp2, size;
++        value cls = 10;
++	value * to;
++	int b = 0;
++	// heap の tp
++	value tp_heap = (value) 0;
++	
++	// shift (fun k -> k 3) のような実行に対する error 
++	if (rp == (value) 0 || rp_a == (value) 0) raise_without_reset();
++
++	//	printf ("%d, %d\n", rsp, tp);
++	// 
++	// コピーするフレームの内部に tp がある場合
++	if (rp >= tp && rsp <= tp) { 
++	  if (flg == -1) printf ("** tp is in the frame !! (Bug)\n");
++	  // flg を立てる
++	  b = 1; }
++	if (cache_size) heapify_env();
++	// flg = 2;
++	// printf ("shift\n");
++	if (flg >= 3)
++	  { for (tmp1 = -10; tmp1 < 11; tmp1++) 
++	      printf ("%3d: %d\n", tmp1, *(rsp + tmp1)); }
++	//for (i = -1; i < 21; i++) printf ("s%3d: %d\n", i, *(rsp+i));
++	// i = 0; while (*asp != RESETMARK) { ++asp; ++i; }
++	i = ((int)rp_a - (int)asp) / word_size;
++	asp = rp_a - word_size;
++	if (i != 0) i--;
++	/* たまに *(rsp - 1) のところに RESETMARK があるので、
++	   こういう妙なコードにしてある; */
++	//j = 0; while (*(rsp - 1) != rp) { ++rsp; ++j; }
++	if (flg >= 3) printf ("%d, ", rsp);
++	j = ((int)rp - (int)rsp) / word_size;
++	rsp = rp - word_size;
++	if (j != 0) j--;
++	// printf ("\na: %d, r: %d\n", i, j);
++	if (flg >= 3) printf ("%d; %d\n", rsp, j);
++	if (flg == 3)
++	  { for (tmp1 = -5; tmp1 < 6; tmp1++) 
++	      printf ("%3d: %d\n", tmp1, *(rsp + tmp1)); }
++	// if (j != 0) { j--; }
++	/* (i + 1) + (j + 1) + frame size 2 つ + 
++	     pc + env + pc->copyblocks + cache_size + tp + asp */
++	// printf ("size: %d, %d\n", i, j);
++	size = i + j + 10;
++	if (size < Max_young_wosize) {
++	  asp -= i; rsp -= j;		// Alloc_small may call minor_gc.
++	  Alloc_small (cls, size, Cont_tag);
++	  asp += i; rsp += j;
++	  Field (cls, 5) = cache_size;
++	  Field (cls, 4) = j;
++	  Field (cls, 3) = pc;
++	  Field (cls, 2) = i;
++	  /*
++	  for (tmp1 = -10; tmp1 < 11; tmp1++) 
++	  printf ("%3d(%d): %d\n", tmp1, tmp1 + rsp, *(tmp1 + rsp)); */
++	  tmp1 = i; tmp2 = j;
++	  while (i >= 0) { Field(cls, i + 8) = *(asp - i - 1); i--; }
++	  while (j >= 0) { 
++	    // tp に来たら
++	    //	    printf ("%d, %d\n", (int) tp + 16, rsp - j - 1);
++	    if (b && (int)(rsp - j - 1) == (int) tp + word_size * 4) {
++	      //	      printf ("%d!!!!\n", Field(cls, j + tmp1 + 8));
++	      // tp を 1 つ巻き戻して
++	      tp = tp->tp;
++	      // heap のほうには heap の tp を保存
++	      Field(cls, j + tmp1 + 9) = tp_heap;
++	      // heap の tp も更新
++	      //	      printf ("%d' %d\n", cls, cls + j + tmp1 + 8);
++	      tp_heap = j + tmp1 + 9; // cls + j + tmp1 + 9;
++	      // printf ("%d, %d\n", tp_heap, cls);
++	    } else { Field(cls, j + tmp1 + 9) = *(rsp - j - 1); } 
++	    j--; }
++	  Field (cls, 6) = tp_heap;
++	  Field (cls, 7) = asp;
++	  i = 0; while (*(pc + i) != COPYBLOCKS) i++;
++	  Env_val(cls) = env;
++	  Code_val(cls) = pc + i; }
++	else {
++	  // printf ("big! %d, %d\n", i, j);
++	  // printf ("pc: %d, cache size: %d\n", pc, cache_size);
++	  // "Setup_for_gc" madifies a top value of asp. => -i (& -j)
++	  asp -= i; rsp -= j;
++	  Setup_for_gc;
++	  cls = alloc_shr (size, Cont_tag);
++	  Restore_after_gc;
++	  // +i (& +j)
++	  asp += i; rsp += j;
++	  to = &Field(cls, 0);
++	  initialize (to + 5, cache_size);
++	  initialize (to + 4, j);
++	  initialize (to + 3, pc);
++	  initialize (to + 2, i);
++	  tmp1 = i; tmp2 = j;
++	  while(i >= 0) { initialize (to + i + 8, *(asp - i - 1)); i--; }
++	  // printf ("* * * %d * * *\n", *(asp));
++	  while(j >= 0) {
++	    // tp に来たら
++	    if (b && (int)(rsp - j - 1) == (int) tp + word_size * 4) {
++	      // tp を 1 つ巻き戻して
++	      tp = tp->tp;
++	      // heap のほうには heap の tp を保存
++	      Field(cls, j + tmp1 + 9) = tp_heap;
++	      // heap の tp も更新
++	      tp_heap = j + tmp1 + 9; // cls + j + tmp1 + 9;
++	    } else { Field(cls, j + tmp1 + 9) = *(rsp - j - 1); } 
++	    j--; }
++	  initialize (to + 6, tp_heap);
++	  initialize (to + 7, asp);
++	  i = 0; while (*(pc + i) != COPYBLOCKS) i++;
++	  initialize (to + 1, env);
++	  initialize (to, pc + i); 
++	  // printf ("env: %d, copy's pc: %d, ", env, pc + i);
++	}
++	*--rsp = cls;
++	cache_size = 1;			// OK ??
++	pc = Code_val(accu);
++	env = Env_val(accu);
++	// printf ("accu: %d\n", cls);
++	//	printf ("** %d **\n", tp_heap);
++	goto check_stacks; }
++    Instruct(COPYBLOCKS):
++      { int i, j, tmp1, tmp2;
++	// printf ("COPY!\n");
++	value arg;
++	value tp_heap;
++	value tp_heap_back = (value) 0;
++	value tp_asp;
++	arg = *rsp++;			// get an arg
++	if (flg >= 3) 
++	  for (i = -10; i < 11; i++) printf ("cc%3d: %d\n", i, *(rsp + i));
++	// *--asp = RESETMARK;
++	*--asp = rp_a;
++	rp_a = asp + 1;
++	*--rsp = rp;
++	if (flg == 3) printf ("\t\t*** reset mark !! *** %d ***\t", rp);
++	rp = rsp + 1;
++	if (flg == 3) printf ("%d\n", rp);
++	tp_asp = Field (accu, 7);
++	tp_heap = Field (accu, 6);
++	cache_size = Field (accu, 5);
++	j = Field (accu, 4);
++	pc = Field (accu, 3);
++	i = Field (accu, 2);
++	// printf ("accu: %d\n", accu);
++	//printf ("%d, %d, %d\n", j, pc, i);
++	if (flg == 3) 
++	  printf("asp: %d, rsp: %d, pc: %d, pc*: %d\n", i, j, pc, *pc); 
++	tmp1 = i; tmp2 = j;
++	
++	/********************/
++	/* copy する分の stack があるか check する */
++	while ((asp - tmp1) < arg_stack_threshold) {
++	  /* printf ("after_copy : (asp < arg_stack_threshold) = (%d < %d)\n",
++	     asp - tmp1, arg_stack_threshold); */
++	  Setup_for_gc;
++	  realloc_arg_stack0 (); // 強制 realloc (stack.c 追加)
++	  rsp = extern_rsp; asp = extern_asp;
++	  rp = extern_rp; rp_a = extern_rp_a;  
++	  Restore_after_gc;
++	}
++	while ((rsp - tmp2) < ret_stack_threshold) {
++	  /* printf ("after_copy : (rsp < threshold) = (%d < %d)\n",
++	     rsp - tmp2, ret_stack_threshold); */
++	  Setup_for_gc;
++	  realloc_ret_stack0 (); // 強制 realloc (stack.c 追加)
++	  rsp = extern_rsp; asp = extern_asp;
++	  rp = extern_rp; rp_a = extern_rp_a;
++	  Restore_after_gc;
++	}
++	/********************/
++	
++	/* arg stack にコピー */
++	while (i >= 0) { *(asp - i - 1) = Field (accu, i + 8); i--; } 
++	/* return stack にコピー */
++	while (j >= 0) {
++	  // trap frame の trap pointer の場合
++	  //	  if (tp_heap == accu + tmp1 + tmp2 - j + 9) {
++	  if ((int)tp_heap == tmp1 + tmp2 - j + 9) { // CHECK
++	    if (flg == -1) 
++	      printf ("%d, %d, %d, %d, %d??\n", 
++		      Field (accu, tmp1 + tmp2 - j + 8), 
++		      Field (accu, tmp1 + tmp2 - j + 9), 
++		      Field (accu, tmp1 + tmp2 - j + 10), 
++		      Field (accu, tmp1 + tmp2 - j + 11), 
++		      Field (accu, tmp1 + tmp2 - j + 12)); 
++	    // tp を保存
++	    *(rsp - tmp2 + j - 1) = tp;
++	    // その trap frame を指すように tp を更新
++	    tp = (struct trap_frame *) (rsp - tmp2 + j - 1 - 4);
++	    tp_heap_back = tp_heap;
++	    tp_heap = Field(accu, tmp1 + tmp2 - j + 9);
++	    //	  } else if (tp_heap_back + 1 == accu + tmp1 + tmp2 - j + 9) {
++	  } else if ((int)tp_heap_back + 1 == tmp1 + tmp2 - j + 9) { // CHECK
++	    if (flg == -1)
++	      printf ("%d, %d, %d, %d, %d??\n", 
++		      Field (accu, tmp1 + tmp2 - j + 8), 
++		      Field (accu, tmp1 + tmp2 - j + 9), 
++		      Field (accu, tmp1 + tmp2 - j + 10), 
++		      Field (accu, tmp1 + tmp2 - j + 11), 
++		      Field (accu, tmp1 + tmp2 - j + 12));
++	    if (flg == -1)
++	      printf ("!!!%d, %d, %d -> %d !!!\n", 
++		      (int)asp, tp_asp, Field (accu, tmp1 + tmp2 - j + 9), 
++		      (Field (accu, tmp1 + tmp2 - j + 9) + (int)asp - tp_asp));
++	      /*	      printf ("%d, %d\n", 
++		      asp - tp_asp + Field (accu, tmp1 + tmp2 - j + 9), 
++		      Field (accu, tmp1 + tmp2 - j + 9)) ; */
++	    // asp が意図していたところを指すように変更して保存
++	    // int に cast しないとコケる
++	    *(rsp - tmp2 + j - 1) = 
++	      (value)((int)asp - 
++		      (int)tp_asp + Field (accu, tmp1 + tmp2 - j + 9));
++	  } else { *(rsp - tmp2 + j - 1) = Field (accu, tmp1 + tmp2 - j + 9); }
++	  j--;
++	} 
++	if (flg == -1) {
++	  printf ("tp (%d): %d, %d, %d, %d(%d), %d\n", 
++		  tp, tp->pc, tp->env, tp->cache_size, 
++		  tp->asp, *tp->asp, tp->tp); }
++	// while (j >= 0) { *(rsp - j - 1) = Field (accu, j + tmp1 + 8); j--; }
++	/*
++	while (j >= 0) { 
++	  if (tp_heap == accu + j + tmp1 + 8) {
++	    *(rsp - j - 1) = tp;
++	    tp_heap = Field (accu, j + tmp1 + 8);
++	    tp = 4;
++	  } else {
++	  *(rsp - j - 1) = Field (accu, j + tmp1 + 8); j--; }} */
++	asp -= tmp1;
++	rsp -= tmp2;
++	if (flg == 3) 
++	  for (i = -10; i < 11; i++) printf ("c%3d: %d\n", i, *(rsp + i)); 
++	accu = arg;
++	//for (i = -1; i < 21; i++) printf ("c%3d: %d\n", i, *(rsp + i));
++        // printf ("argument of a captured cont: %d\n", (accu - 1) / 2);
++	if (flg >= 3)  
++	  printf("*** *** argument of k: %d *** ***\n", (arg - 1) / 2); 
++	// for (i = -10; i < 11; i++) printf ("pc%3d: %d\n", i, *(pc + i));
++	// 	printf ("%d??\n", rp);
++	//	extern_rp = rp;
++
++	Next; }
++
+     Instruct(BREAK):
+       Setup_for_gc;
+       retsp->pc = pc - 1;
+diff -urN cl75/src/runtime/io.c OchaCaml/src/runtime/io.c
+--- cl75/src/runtime/io.c	1997-04-24 23:51:06.000000000 +0900
++++ OchaCaml/src/runtime/io.c	2014-04-14 14:04:08.000000000 +0900
+@@ -1,5 +1,9 @@
+ /* Buffered input/output. */
+ 
++#include "../../config/s.h"
++#ifdef HAS_UNISTD
++#include <unistd.h>
++#endif
+ #include <errno.h>
+ #ifdef __MWERKS__
+ #include "myfcntl.h"
+diff -urN cl75/src/runtime/main.c OchaCaml/src/runtime/main.c
+--- cl75/src/runtime/main.c	1997-04-24 23:51:06.000000000 +0900
++++ OchaCaml/src/runtime/main.c	2014-04-14 14:04:08.000000000 +0900
+@@ -1,5 +1,9 @@
+ /* Start-up code */
+ 
++#include "../../config/s.h"
++#ifdef HAS_UNISTD
++#include <unistd.h>
++#endif
+ #include <stdio.h>
+ #ifdef __MWERKS__
+ #include "myfcntl.h"
+diff -urN cl75/src/runtime/major_gc.c OchaCaml/src/runtime/major_gc.c
+--- cl75/src/runtime/major_gc.c	1997-04-24 23:51:07.000000000 +0900
++++ OchaCaml/src/runtime/major_gc.c	2014-04-14 14:04:08.000000000 +0900
+@@ -72,6 +72,7 @@
+      value v;
+ {
+   if (Is_block (v) && Is_in_heap (v) && Is_white_val (v)){
++    // printf ("darken!\n");
+     Hd_val (v) = Grayhd_hd (Hd_val (v));
+     *gray_vals_cur++ = v;
+     if (gray_vals_cur >= gray_vals_end) realloc_gray_vals ();
+@@ -107,6 +108,8 @@
+       Assert (Is_gray_val (v));
+       Hd_val (v) = Blackhd_hd (Hd_val (v));
+       if (Tag_val (v) < No_scan_tag){
++	//	if (Tag_val (v) == Cont_tag) printf ("mark_slice is called!\n");
++	//	printf ("mark_slice: %d\n", Wosize_val(v));
+ 	for (i = Wosize_val (v); i != 0;){
+ 	  --i;
+ 	  child = Field (v, i);
+@@ -223,12 +226,14 @@
+ #define Margin 100  /* Make it a little faster to be on the safe side. */
+ 
+   if (gc_phase == Phase_mark){
++    //printf ("mark\n");
+     mark_slice (2 * (100 - percent_free)
+ 		* (allocated_words * 3 / percent_free / 2
+                    + 100 * extra_heap_memory)
+ 		+ Margin);
+     gc_message ("!", 0);
+   }else{
++    //printf ("sweep\n");
+     Assert (gc_phase == Phase_sweep);
+     sweep_slice (200 * (allocated_words * 3 / percent_free / 2
+ 			+ 100 * extra_heap_memory)
+diff -urN cl75/src/runtime/minor_gc.c OchaCaml/src/runtime/minor_gc.c
+--- cl75/src/runtime/minor_gc.c	1996-04-23 22:15:24.000000000 +0900
++++ OchaCaml/src/runtime/minor_gc.c	2014-04-14 14:04:08.000000000 +0900
+@@ -72,6 +72,9 @@
+       value field0 = Field (v, 0);
+       mlsize_t sz = Wosize_val (v);
+ 
++      //printf ("%d\n", sz);
++      // if (Tag_val(v) == Cont_tag) { printf ("gc! %d\n", sz); }
++
+       result = alloc_shr (sz, Tag_val (v));
+       *p = result;
+       Hd_val (v) = Bluehd_hd (Hd_val (v));    /* Put the forward flag. */
+@@ -81,6 +84,7 @@
+         v = field0;
+         goto tail_call;
+       }else{
++	// printf ("?%d\n", sz);
+         oldify (&Field (result, 0), field0);
+         for (i = 1; i < sz - 1; i++){
+           oldify (&Field (result, i), Field (v, i));
+@@ -108,7 +112,7 @@
+   old_external_raise = external_raise;
+   external_raise = &raise_buf;
+ 
+-  gc_message ("<", 0);
++  gc_message ("<", 0); 
+   local_roots (oldify);
+   for (r = ref_table; r < ref_table_ptr; r++) oldify (*r, **r);
+   stat_minor_words += Wsize_bsize (young_ptr - young_start);
+diff -urN cl75/src/runtime/mlvalues.h OchaCaml/src/runtime/mlvalues.h
+--- cl75/src/runtime/mlvalues.h	1997-04-24 23:51:07.000000000 +0900
++++ OchaCaml/src/runtime/mlvalues.h	2014-04-14 14:04:08.000000000 +0900
+@@ -165,6 +165,7 @@
+ #define Code_val(val) (((code_t *) (val)) [0])     /* Also an l-value. */
+ #define Env_val(val) (Field(val, 1))               /* Also an l-value. */
+ 
++#define Cont_tag (No_scan_tag - 2)
+ 
+ /* 2- If tag >= No_scan_tag : a sequence of bytes. */
+ 
+diff -urN cl75/src/runtime/roots.c OchaCaml/src/runtime/roots.c
+--- cl75/src/runtime/roots.c	1994-11-02 02:36:08.000000000 +0900
++++ OchaCaml/src/runtime/roots.c	2014-04-14 14:04:08.000000000 +0900
+@@ -11,26 +11,67 @@
+ {
+   register value *sp;
+   register int i;
++  register value *rp;
++  value *tmp;
+ 
++  // printf ("??\n");
+   /* argument stack */
+-  for (sp = extern_asp; sp < arg_stack_high; sp++) {
+-    if (*sp != MARK) copy_fn (sp, *sp);
++  for (sp = extern_asp, rp = extern_rp_a; sp < arg_stack_high; sp++) {
++    if (*sp != MARK) {
++      if (sp + 1 != rp ) copy_fn (sp, *sp); 
++      else rp = *(rp - 1);
++    }
+   }
++  
++  // printf ("??? %d\n", extern_rp);
++  
++  int j;
++  int flg = 0; 
++  //for (j = -5; j <= 30; j++) printf ("%3d: %d\n", j, *(extern_rsp + j));
++  //printf ("\n");
+ 
+   /* return stack */
+-  for (sp = extern_rsp; sp < ret_stack_high; ) {
+-    copy_fn (&((struct return_frame *) sp)->env,
+-	     ((struct return_frame *) sp)->env);
+-    i = ((struct return_frame *) sp)->cache_size;
+-    sp = (value *) ((char *) sp + sizeof(struct return_frame));
+-    while (i > 0) {
+-      Assert (sp < ret_stack_high);
+-      copy_fn (sp, *sp);
+-      sp++;
+-      i--;
+-    }
++  // printf ("%d\n", ret_stack_high);
++  
++  sp = 551860; // ret_stack_high;
++  /*
++  for (j = -10; j < 11; j++) 
++  printf ("%3d(%d): %d; %d\n", j, sp + j, *(sp + j), extern_rp); 
++  printf ("%d\n", extern_rp); */
++  for (sp = extern_rsp, rp = extern_rp; sp < ret_stack_high; ) {
++    // for (sp = extern_rsp; sp < ret_stack_high; ) {
++    //    if (*sp != RESETMARK) {
++    if (sp + 1 != rp) {
++      //for (j = -5; j <= 30; j++) printf ("%3d: %d\n", j, *(sp + j)) ;
++      // printf ("\n");
++      // printf ("%d\n", *(sp - 1));
++      if (flg) printf ("%d, %d, ", sp, rp);
++     
++      copy_fn (&((struct return_frame *) sp)->env,
++	       ((struct return_frame *) sp)->env);
++      i = ((struct return_frame *) sp)->cache_size;
++      if (flg) printf ("%d\n", i);
++      if (i > 20 && flg) 
++	for (j = -10; j < 11; j++) 
++	  printf ("%d(%3d): %d\n", sp + j, j, *(sp + j)); 
++      if (i > 20) printf ("%d\n", sp);
++      sp = (value *) ((char *) sp + sizeof(struct return_frame));
++      while (i > 0) {
++	Assert (sp < ret_stack_high);
++	copy_fn (sp, *sp);
++	sp++;
++	i--;
++      }
++    } else { if (flg) {
++	printf ("reset mark %d, %d\n", rp, sp + 1); 
++	for (j = -10; j < 11; j++) {
++	  printf ("%d(%3d): %d\n", sp + j, j, *(sp + j)); }}
++      // copy_fn (sp, *sp);
++      rp = *(rp - 1); 
++      if (flg) printf ("** %d\n", rp); sp++; }
+   }
+-
++  
++  // printf ("????\n");
+   /* C roots */
+   {
+     value *block;
+diff -urN cl75/src/runtime/stacks.c OchaCaml/src/runtime/stacks.c
+--- cl75/src/runtime/stacks.c	1995-02-19 02:51:06.000000000 +0900
++++ OchaCaml/src/runtime/stacks.c	2014-04-14 14:04:08.000000000 +0900
+@@ -16,6 +16,8 @@
+ value * ret_stack_threshold;
+ value * extern_asp;
+ value * extern_rsp;
++value extern_rp;
++value extern_rp_a;
+ struct trap_frame * tp;
+ value global_data;
+ 
+@@ -38,7 +40,8 @@
+   asize_t size;
+   value * new_low, * new_high, * new_asp;
+   struct trap_frame * p;
+-
++  value * rp_a;
++  
+   Assert(extern_asp >= arg_stack_low);
+   size = arg_stack_high - arg_stack_low;
+   if (size >= Max_arg_stack_size)
+@@ -59,6 +62,15 @@
+   stat_free((char *) arg_stack_low);
+   for (p = tp; p < (struct trap_frame *) ret_stack_high; p = p->tp)
+     p->asp = (value *) shift(p->asp);
++
++  /* shift rp_a */
++  if (extern_rp_a > 0) {
++    extern_rp_a = (value *) shift (extern_rp_a);
++    for (rp_a = extern_rp_a; *(rp_a - 1) > 0; rp_a = *(rp_a - 1)) {
++      *(rp_a - 1) = (value *) shift (*(rp_a - 1));
++    }
++  }
++
+   arg_stack_low = new_low;
+   arg_stack_high = new_high;
+   arg_stack_threshold = arg_stack_low + Arg_stack_threshold / sizeof (value);
+@@ -72,7 +84,8 @@
+   asize_t size;
+   value * new_low, * new_high, * new_rsp;
+   struct trap_frame * p;
+-
++  value * rp;
++  
+   Assert(extern_rsp >= ret_stack_low);
+   size = ret_stack_high - ret_stack_low;
+   if (size >= Max_ret_stack_size)
+@@ -96,6 +109,15 @@
+     p->tp = (struct trap_frame *) shift(p->tp);
+   }
+   trap_barrier = (value *) shift(trap_barrier);
++
++  /* shift rp */
++  if (extern_rp > 0) {
++    extern_rp = (value *) shift (extern_rp);
++    for (rp = extern_rp; *(rp - 1) > 0; rp = *(rp - 1)) {
++      *(rp - 1) = (value *) shift (*(rp - 1));
++    }
++  }
++  
+   ret_stack_low = new_low;
+   ret_stack_high = new_high;
+   ret_stack_threshold = ret_stack_low + Ret_stack_threshold / sizeof (value);
+@@ -111,3 +133,13 @@
+   if (extern_asp < arg_stack_threshold)
+     realloc_arg_stack();
+ }
++
++void realloc_ret_stack0()
++{
++    realloc_ret_stack();
++}
++
++void realloc_arg_stack0()
++{
++    realloc_arg_stack();
++}
+diff -urN cl75/src/runtime/stacks.h OchaCaml/src/runtime/stacks.h
+--- cl75/src/runtime/stacks.h	1996-04-23 22:15:27.000000000 +0900
++++ OchaCaml/src/runtime/stacks.h	2014-04-14 14:04:08.000000000 +0900
+@@ -8,7 +8,7 @@
+ #include "mlvalues.h"
+ #include "memory.h"
+ 
+-/* 1- Argument stack : (value | mark)*  */
++/* 1- Argument stack : (value | mark | resetmark)*  */
+ 
+ #define MARK ((value) 0)
+ 
+@@ -21,6 +21,8 @@
+ 	return_frame with cache_size = N	trap_frame with cache_size=N+2
+ 		...
+    Low addresses
++
++   OR reset pointer
+ */
+ 
+ struct return_frame {
+@@ -47,6 +49,8 @@
+ extern value * ret_stack_threshold;
+ extern value * extern_asp;
+ extern value * extern_rsp;
++extern value extern_rp;
++extern value extern_rp_a;
+ extern struct trap_frame * tp;
+ extern value global_data;
+ 
+diff -urN cl75/src/toplevel/do_phr.ml OchaCaml/src/toplevel/do_phr.ml
+--- cl75/src/toplevel/do_phr.ml	1997-09-08 21:04:10.000000000 +0900
++++ OchaCaml/src/toplevel/do_phr.ml	2014-04-14 14:04:08.000000000 +0900
+@@ -26,14 +26,16 @@
+     Zexpr expr ->
+       let ty =
+         type_expression phr.im_loc expr in
++      let insts = (compile_lambda false (translate_expression expr)) in
++(*      instruct__print_inst insts; *)
+       let res =
+-        load_phrase(compile_lambda false (translate_expression expr)) in
++        load_phrase insts in 
+       flush std_err;
+       open_box 1;
+       print_string "- :"; print_space();
+-      print_one_type ty;
++      print_one_type ty; 
+       print_string " ="; print_space();
+-      print_value res ty;
++      print_value res ty; 
+       print_newline()
+   | Zletdef(rec_flag, pat_expr_list) ->
+       let env = type_letdef phr.im_loc rec_flag pat_expr_list in
+diff -urN cl75/src/toplevel/fmt_type.ml OchaCaml/src/toplevel/fmt_type.ml
+--- cl75/src/toplevel/fmt_type.ml	1997-02-04 02:19:59.000000000 +0900
++++ OchaCaml/src/toplevel/fmt_type.ml	2014-04-14 14:04:08.000000000 +0900
+@@ -49,24 +49,122 @@
+     var_name
+ ;;
+ 
+-let rec print_typ priority ty =
++let rec print_typ' priority ty =
+   let ty = type_repr ty in
+   match ty.typ_desc with
+     Tvar _ ->
+       print_string "'";
+       print_string (name_of_type_var ty)
+-  | Tarrow(ty1, ty2) ->
++  | Tarrow(ty1, ty2, ty3, ty4) ->
+       if priority >= 1 then begin open_box 1; print_string "(" end
++      else open_box 0;
++      print_string "("; 
++      print_typ' 1 ty1;
++      print_string " / "; 
++      print_typ' 0 ty2;  (* 0 ?? *)
++      print_string ")"; 
++      print_string " ->"; print_space();
++      print_string "("; 
++      print_typ' 0 ty3;  (* 0 ?? *)
++      print_string " / ";
++      print_typ' 0 ty4;
++      print_string ")"; 
++      if priority >= 1 then print_string ")";
++      close_box()
++  | Tproduct(ty_list) ->
++      if priority >= 2 then begin open_box 1; print_string "(" end
+        else open_box 0;
+-      print_typ 1 ty1;
++      print_typ'_list 2 " *" ty_list;
++      if priority >= 2 then print_string ")";
++      close_box()
++  | Tconstr(cstr, args) ->
++      open_box 0;
++      begin match args with
++        []    -> ()
++      | [ty1] ->
++          print_typ' 2 ty1; print_space ()
++      | tyl ->
++          open_box 1;
++          print_string "(";
++          print_typ'_list 0 "," tyl;
++          print_string ")";
++          close_box();
++          print_space()
++      end;
++      print_global types_of_module cstr;
++      close_box()
++
++and print_typ'_list priority sep = function
++    [] ->
++      ()
++  | [ty] ->
++      print_typ' priority ty
++  | ty::rest ->
++      print_typ' priority ty;
++      print_string sep; print_space();
++      print_typ'_list priority sep rest
++;; 
++
++let rec compare t1 t2 = match (t1.typ_desc, t2.typ_desc) with 
++  | Tvar Tnolink, Tvar Tnolink -> t1 == t2
++  | Tvar (Tlinkto t), _ -> compare t t2
++  | _, Tvar (Tlinkto t) -> compare t1 t
++  | _, _ -> false;;
++
++let rec get_tlevel t = match t.typ_desc with
++  | Tvar Tnolink -> t.typ_level
++  | Tvar (Tlinkto t) -> get_tlevel t
++  | _ -> generic + 1;;
++
++let rec print_typ priority ty tvars =
++  let ty = type_repr ty in
++  match ty.typ_desc with
++    Tvar _ ->
++      print_string "'";
++      print_string (name_of_type_var ty)
++  | Tarrow(ty1, ({ typ_desc = (Tvar _) } as ty2), ty3, ty4) 
++      when compare ty2 ty4 && 
++           for_all (fun ty -> not (compare ty2 ty))
++	     ((free_type_vars (-1) ty1) @ 
++		(free_type_vars (-1) ty3) @ tvars) &&
++	   get_tlevel ty2 = generic ->
++      if priority >= 1 then begin open_box 1; print_string "(" end
++       else open_box 0;
++      print_typ 1 ty1 ((free_type_vars (-1) ty3) @ tvars);
+       print_string " ->"; print_space();
+-      print_typ 0 ty2;
++      print_typ 0 ty3 ((free_type_vars (-1) ty1) @ tvars); 
++      if priority >= 1 then print_string ")";
++      close_box()
++  | Tarrow(ty1, ty2, ty3, ty4) ->
++      let ftv1 = free_type_vars (-1) ty1
++      and ftv2 = free_type_vars (-1) ty2
++      and ftv3 = free_type_vars (-1) ty3
++      and ftv4 = free_type_vars (-1) ty4 in
++      if priority >= 1 then begin open_box 1; print_string "(" end
++      else open_box 0;
++      if (ty2 = ty4 && !typ_option <> "all") || !typ_option = "none"
++      then 
++	begin
++	  print_typ 1 ty1 (tvars @ ftv2 @ ftv3 @ ftv4);
++	  print_string " => ";
++	  print_typ 0 ty3 (tvars @ ftv2 @ ftv1 @ ftv4);
++	end
++      else 
++	begin 
++	  print_typ 1 ty1 (tvars @ ftv2 @ ftv3 @ ftv4);
++	  print_string " / "; 
++	  print_typ 1 ty2 (tvars @ ftv1 @ ftv3 @ ftv4);
++	  print_string " ->"; print_space();
++	  print_typ 1 ty3 (tvars @ ftv2 @ ftv1 @ ftv4);
++	  print_string " / ";
++	  print_typ 1 ty4 (tvars @ ftv2 @ ftv3 @ ftv1);
++	end;
+       if priority >= 1 then print_string ")";
+       close_box()
+   | Tproduct(ty_list) ->
+       if priority >= 2 then begin open_box 1; print_string "(" end
+        else open_box 0;
+-      print_typ_list 2 " *" ty_list;
++      print_typ_list 2 " *" tvars ty_list;
+       if priority >= 2 then print_string ")";
+       close_box()
+   | Tconstr(cstr, args) ->
+@@ -74,11 +172,11 @@
+       begin match args with
+         []    -> ()
+       | [ty1] ->
+-          print_typ 2 ty1; print_space ()
++          print_typ 2 ty1 tvars; print_space ()
+       | tyl ->
+           open_box 1;
+           print_string "(";
+-          print_typ_list 0 "," tyl;
++          print_typ_list 0 "," tvars tyl;
+           print_string ")";
+           close_box();
+           print_space()
+@@ -86,15 +184,20 @@
+       print_global types_of_module cstr;
+       close_box()
+ 
+-and print_typ_list priority sep = function
++and print_typ_list priority sep tvars = function
+     [] ->
+       ()
+   | [ty] ->
+-      print_typ priority ty
++      print_typ priority ty tvars
+   | ty::rest ->
+-      print_typ priority ty;
++      print_typ priority ty tvars;
+       print_string sep; print_space();
+-      print_typ_list priority sep rest
++      print_typ_list priority sep tvars rest
+ ;;
+ 
+-let print_one_type ty = reset_type_var_name(); print_typ 0 ty;;
++let print_typ tl t = print_typ tl t [];;
++
++let print_one_type ty = reset_type_var_name(); 
++(*   print_newline (); print_string "* dubug * : "; 
++   print_typ' 0 ty; print_newline ();  *)
++  print_typ 0 ty;;
+diff -urN cl75/src/toplevel/load_phr.ml OchaCaml/src/toplevel/load_phr.ml
+--- cl75/src/toplevel/load_phr.ml	1997-02-04 02:19:59.000000000 +0900
++++ OchaCaml/src/toplevel/load_phr.ml	2014-04-14 14:04:08.000000000 +0900
+@@ -56,13 +56,17 @@
+     if phr.kph_rec then begin
+       emit phr.kph_init;
+       out STOP;
++(*      emit [Klabel 1; Kprim prim__Pcopyblocks];	(* added *)*)
+       emit phr.kph_fcts;
++      emit [Klabel 1; Kprim prim__Pcopyblocks];
+       0
+     end else begin
++(*      emit [Klabel 1; Kprim prim__Pcopyblocks];	(* added *)*)
+       emit phr.kph_fcts;
+       let p = !out_position in
+       emit phr.kph_init;
+       out STOP;
++      emit [Klabel 1; Kprim prim__Pcopyblocks];
+       p
+     end in
+   let len = !out_position in
+diff -urN cl75/src/toplevel/pr_value.mlp OchaCaml/src/toplevel/pr_value.mlp
+--- cl75/src/toplevel/pr_value.mlp	1997-02-04 02:20:00.000000000 +0900
++++ OchaCaml/src/toplevel/pr_value.mlp	2014-04-14 14:04:08.000000000 +0900
+@@ -89,7 +89,7 @@
+     match (type_repr ty).typ_desc with
+       Tvar _ ->
+         print_string "<poly>"
+-    | Tarrow(ty1, ty2) ->
++    | Tarrow(ty1, ty2, ty3, ty4) ->
+         print_string "<fun>"
+     | Tproduct(ty_list) ->
+         if prio > 0 then begin open_box 1; print_string "(" end
+@@ -178,9 +178,9 @@
+           loop depth false label_list
+       in
+       open_box 1;
+-      print_string "{";
++      print_string "{ ";
+       cautious (print_fields depth) label_list;
+-      print_string "}";
++      print_string " }";
+       close_box()
+   | Abbrev_type(params, body) ->
+       print_val prio depth obj (expand_abbrev params body ty_list)
+diff -urN cl75/src/toplevel/toplevel.ml OchaCaml/src/toplevel/toplevel.ml
+--- cl75/src/toplevel/toplevel.ml	1997-09-08 21:04:11.000000000 +0900
++++ OchaCaml/src/toplevel/toplevel.ml	2014-04-14 14:04:08.000000000 +0900
+@@ -150,7 +150,8 @@
+ 
+ let rec trace_instr name val ty =
+   match (type_repr ty).typ_desc with
+-    Tarrow(t1,t2) ->
++    Tarrow(t1,t2,t3,t4) ->
++      (* とりあえず、t1 & t3 しか出力しない格好;; *)
+       let namestar = name ^ "*" in
+       repr(fun arg ->
+         print_string name; print_string " <-- ";
+@@ -158,8 +159,8 @@
+         try
+           let res = (magic_obj val : obj -> obj) arg in
+            print_string name; print_string " --> ";
+-           print_value res t2; print_newline ();
+-           trace_instr namestar res t2
++           print_value res t3; print_newline ();
++           trace_instr namestar res t3
+         with exc ->
+            print_string name;
+            print_string " raises ";
+@@ -221,8 +222,10 @@
+     let val_desc = find_value_desc (parse_global name) in
+     begin try
+       push_type_level();
+-      let ty_arg = new_type_var() in
+-      let ty_printer = type_arrow(ty_arg, type_unit) in
++      let ty_arg = new_type_var()
++      and ty_ansa = new_type_var()
++      and ty_ansb = new_type_var() in
++      let ty_printer = type_arrow(ty_arg, ty_ansa, type_unit, ty_ansb) in
+       unify (type_instance val_desc.info.val_typ, ty_printer);
+       pop_type_level();
+       generalize_type ty_arg;
+diff -urN cl75/src/toplevel/version.mlp OchaCaml/src/toplevel/version.mlp
+--- cl75/src/toplevel/version.mlp	1995-06-08 03:49:44.000000000 +0900
++++ OchaCaml/src/toplevel/version.mlp	2014-04-14 14:04:08.000000000 +0900
+@@ -5,4 +5,4 @@
+ #endif
+ 
+ let print_banner() =
+-  interntl__printf ">       Caml Light version %s\n" VERSION; ();;
++  interntl__printf ">       Caml Light version %s + shift/reset\n" VERSION; ();;
+diff -urN cl75/src/yacc/error.c OchaCaml/src/yacc/error.c
+--- cl75/src/yacc/error.c	1995-06-07 22:34:31.000000000 +0900
++++ OchaCaml/src/yacc/error.c	2014-04-14 14:06:00.000000000 +0900
+@@ -40,7 +40,7 @@
+ {
+     register char *s;
+ 
+-    if (st_line == 0) return;
++    if (st_line == 0) return 0;
+     for (s = st_line; *s != '\n'; ++s)
+     {
+ 	if (isprint(*s) || *s == '\t')
+diff -urN cl75/src/yacc/main.c OchaCaml/src/yacc/main.c
+--- cl75/src/yacc/main.c	1995-06-07 22:34:32.000000000 +0900
++++ OchaCaml/src/yacc/main.c	2014-04-14 14:06:20.000000000 +0900
+@@ -138,7 +138,7 @@
+ 	case '\0':
+ 	    input_file = stdin;
+ 	    if (i + 1 < argc) usage();
+-	    return;
++	    return 0;
+ 
+ 	case '-':
+ 	    ++i;
+diff -urN cl75/src/yacc/output.c OchaCaml/src/yacc/output.c
+--- cl75/src/yacc/output.c	1995-12-07 00:48:38.000000000 +0900
++++ OchaCaml/src/yacc/output.c	2014-04-14 14:07:13.000000000 +0900
+@@ -345,7 +345,7 @@
+ 	if (to_state[i] != default_state)
+ 	    ++count;
+     }
+-    if (count == 0) return;
++    if (count == 0) return 0;
+ 
+     symno = symbol_value[symbol] + 2*nstates;
+ 
+@@ -737,7 +737,7 @@
+ 	open_error(text_file_name);
+     in = text_file;
+     if ((c = getc(in)) == EOF)
+-	return;
++	return 0;
+     out = code_file;
+     if (c ==  '\n')
+ 	++outline;
+@@ -763,7 +763,7 @@
+     register FILE *in, *out;
+ 
+     if (line == 0)
+-	return;
++	return 0;
+ 
+     in = input_file;
+     out = code_file;
+@@ -772,7 +772,7 @@
+     {
+ 	++lineno;
+ 	if ((c = getc(in)) == EOF)
+-	    return;
++	    return 0;
+ 	if (!lflag)
+ 	{
+ 	    ++outline;
+@@ -827,7 +827,7 @@
+ 	open_error(file_name);
+ 
+     if ((c = getc(*file)) == EOF)
+-	return;
++	return 0;
+ 
+     out = code_file;
+     last = c;
+diff -urN cl75/src/yacc/reader.c OchaCaml/src/yacc/reader.c
+--- cl75/src/yacc/reader.c	1995-06-16 00:52:29.000000000 +0900
++++ OchaCaml/src/yacc/reader.c	2014-04-14 14:09:13.000000000 +0900
+@@ -60,7 +60,7 @@
+ 	if (line) { FREE(line); line = 0; }
+ 	cptr = 0;
+ 	saw_eof = 1;
+-	return;
++	return 0;
+     }
+ 
+     if (line == 0 || linesize != (LINESIZE + 1))
+@@ -76,7 +76,7 @@
+     for (;;)
+     {
+ 	line[i]  =  c;
+-	if (c == '\n') { cptr = line; return; }
++	if (c == '\n') { cptr = line; return 0; }
+ 	if (++i >= linesize)
+ 	{
+ 	    linesize += LINESIZE;
+@@ -89,7 +89,7 @@
+ 	    line[i] = '\n';
+ 	    saw_eof = 1;
+ 	    cptr = line;
+-	    return;
++	    return 0;
+ 	}
+     }
+ }
+@@ -128,7 +128,7 @@
+ 	{
+ 	    cptr = s + 2;
+ 	    FREE(st_line);
+-	    return;
++	    return 0;
+ 	}
+ 	if (*s == '\n')
+ 	{
+@@ -284,14 +284,14 @@
+ 	if (c == '\n')
+ 	{
+ 	    fprintf(f, "\"\n");
+-	    return;
++	    return 0;
+ 	}
+ 	putc(c, f);
+ 	if (c == '"')
+ 	{
+ 	    putc('\n', f);
+ 	    ++cptr;
+-	    return;
++	    return 0;
+ 	}
+     }
+ }
+@@ -402,7 +402,7 @@
+ 	    if (need_newline) putc('\n', f);
+ 	    ++cptr;
+ 	    FREE(t_line);
+-	    return;
++	    return 0;
+ 	}
+ 	/* fall through */
+ 
+@@ -456,7 +456,7 @@
+         if (c == '}' && depth == 0) {
+           fprintf(text_file, " YYSTYPE;\n");
+           FREE(u_line);
+-          return;
++          return 0;
+         }
+         goto loop;
+ 
+@@ -811,7 +811,7 @@
+ 	else if (c == '\'' || c == '"')
+ 	    bp = get_literal();
+ 	else
+-	    return;
++	    return 0;
+ 
+ 	if (bp == goal) tokenized_start(bp->name);
+ 	bp->class = TERM;
+@@ -871,7 +871,7 @@
+ 	else if (c == '\'' || c == '"')
+ 	    bp = get_literal();
+ 	else
+-	    return;
++	    return 0;
+ 
+ 	if (bp->tag && tag != bp->tag)
+ 	    retyped_warning(bp->name);
+@@ -888,7 +888,7 @@
+ 
+     for (;;) {
+       c = nextc();
+-      if (!isalpha(c) && c != '_' && c != '.' && c != '$') return;
++      if (!isalpha(c) && c != '_' && c != '.' && c != '$') return 0;
+       bp = get_name();
+ 
+       if (bp->class == TERM)
+@@ -916,7 +916,7 @@
+ 	switch (k = keyword())
+ 	{
+ 	case MARK:
+-	    return;
++	    return 0;
+ 
+ 	case IDENT:
+ 	    copy_ident();
+@@ -1142,7 +1142,7 @@
+ 	end_rule();
+ 	start_rule(bp, s_lineno);
+ 	++cptr;
+-	return;
++	return 0;
+     }
+ 
+     if (last_was_action)
+@@ -1230,7 +1230,7 @@
+         fprintf(f, ") : '%s))\n", plhs[nrules]->name);
+       if (sflag)
+         fprintf(f, ";;\n");
+-      return;
++      return 0;
+     }
+     putc(c, f);
+     ++cptr;
+@@ -1401,7 +1401,7 @@
+ {
+     register int i;
+ 
+-    if (tag_table == 0) return;
++    if (tag_table == 0) return 0;
+ 
+     for (i = 0; i < ntags; ++i)
+     {
+@@ -1702,7 +1702,7 @@
+     int spacing;
+     register FILE *f = verbose_file;
+ 
+-    if (!vflag) return;
++    if (!vflag) return 0;
+ 
+     k = 1;
+     for (i = 2; i < nrules; ++i)
+diff -urN cl75/src/yacc/verbose.c OchaCaml/src/yacc/verbose.c
+--- cl75/src/yacc/verbose.c	1994-11-02 02:36:18.000000000 +0900
++++ OchaCaml/src/yacc/verbose.c	2014-04-14 14:09:24.000000000 +0900
+@@ -8,7 +8,7 @@
+ {
+     register int i;
+ 
+-    if (!vflag) return;
++    if (!vflag) return 0;
+ 
+     null_rules = (short *) MALLOC(nrules*sizeof(short));
+     if (null_rules == 0) no_space();
